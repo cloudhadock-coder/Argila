@@ -97,6 +97,9 @@ pub struct EditorSettings {
     pub font_size: f32,
     /// Delphi usa 2 espacos por nivel por padrao.
     pub tab_size: usize,
+    /// Codificacao de arquivos sem BOM que nao sao UTF-8: "system" (ANSI do Windows, como o
+    /// Delphi) ou um rotulo como "windows-1250" / "utf-8".
+    pub default_encoding: String,
 }
 
 impl Default for EditorSettings {
@@ -104,6 +107,7 @@ impl Default for EditorSettings {
         Self {
             font_size: 14.0,
             tab_size: 2,
+            default_encoding: "system".to_owned(),
         }
     }
 }

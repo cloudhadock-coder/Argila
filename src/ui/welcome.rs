@@ -7,7 +7,17 @@ use crate::settings::RecentSettings;
 use crate::shortcuts::{Command, Keymap};
 use crate::themes::Palette;
 
-pub fn show(ui: &mut Ui, p: &Palette, keymap: &Keymap, recent: &RecentSettings) -> Option<Command> {
+pub enum WelcomeAction {
+    Command(Command),
+    OpenRecent(String),
+}
+
+pub fn show(
+    ui: &mut Ui,
+    p: &Palette,
+    keymap: &Keymap,
+    recent: &RecentSettings,
+) -> Option<WelcomeAction> {
     let mut fired = None;
     egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
         ui.add_space(40.0);
@@ -21,7 +31,7 @@ pub fn show(ui: &mut Ui, p: &Palette, keymap: &Keymap, recent: &RecentSettings) 
             ui.horizontal_wrapped(|ui| {
                 for cmd in [Command::OpenFile, Command::OpenProject, Command::OpenFolder, Command::NewUnit] {
                     if command_button(ui, cmd.label(), &keymap.shortcut_text(cmd)) {
-                        fired = Some(cmd);
+                        fired = Some(WelcomeAction::Command(cmd));
                     }
                 }
             });
@@ -30,10 +40,12 @@ pub fn show(ui: &mut Ui, p: &Palette, keymap: &Keymap, recent: &RecentSettings) 
             section(ui, p, "Recent");
             let items: Vec<&String> = recent.projects.iter().chain(&recent.files).take(RecentSettings::MAX).collect();
             if items.is_empty() {
-                ui.label(RichText::new("Nothing opened yet.").color(p.text_weak));
+                ui.label(RichText::new("Nothing opened yet. You can also drop files on the window.").color(p.text_weak));
             }
             for path in items {
-                ui.label(RichText::new(path).monospace().color(p.text));
+                if ui.link(RichText::new(path).monospace()).clicked() {
+                    fired = Some(WelcomeAction::OpenRecent(path.clone()));
+                }
             }
 
             ui.add_space(18.0);
@@ -41,7 +53,7 @@ pub fn show(ui: &mut Ui, p: &Palette, keymap: &Keymap, recent: &RecentSettings) 
             ui.horizontal(|ui| {
                 ui.label(RichText::new(format!("Profile: {}", keymap.profile)).color(p.text));
                 if ui.link("View all shortcuts").clicked() {
-                    fired = Some(Command::KeyboardShortcuts);
+                    fired = Some(WelcomeAction::Command(Command::KeyboardShortcuts));
                 }
             });
 
@@ -49,8 +61,9 @@ pub fn show(ui: &mut Ui, p: &Palette, keymap: &Keymap, recent: &RecentSettings) 
             section(ui, p, "Status");
             ui.label(
                 RichText::new(
-                    "Phase 1 (foundation): window, earthy theme, menus, panels, tabs, persistent settings \
-                     and the Delphi keymap. Commands that are not implemented yet say so instead of pretending.",
+                    "Phase 2 (code editor): .pas/.dfm editing with encoding and line ending preservation, \
+                     syntax highlighting, undo/redo, find & replace. Commands that are not implemented yet \
+                     say so instead of pretending.",
                 )
                 .color(p.text_weak),
             );

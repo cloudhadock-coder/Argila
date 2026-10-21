@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, Stroke};
 
+use crate::syntax::TokenKind;
+
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub bg_main: Color32,
@@ -130,4 +132,19 @@ pub fn install_fonts(ctx: &egui::Context) -> Vec<&'static str> {
     }
     ctx.set_fonts(fonts);
     loaded
+}
+
+/// Cores do realce de sintaxe, nos mesmos tons terrosos da interface.
+pub fn syntax_color(p: &Palette, kind: TokenKind) -> Color32 {
+    match kind {
+        TokenKind::Keyword => Color32::from_rgb(0xDB, 0xA2, 0x6B),
+        TokenKind::Comment => Color32::from_rgb(0x8C, 0x81, 0x70),
+        TokenKind::Directive => Color32::from_rgb(0xA3, 0xB5, 0xC9),
+        TokenKind::String => Color32::from_rgb(0xC9, 0xB7, 0x7F),
+        TokenKind::Number => p.success,
+        TokenKind::TypeName => p.warning,
+        TokenKind::Binary => Color32::from_rgb(0x7A, 0x70, 0x62),
+        TokenKind::Symbol => p.text_weak,
+        TokenKind::Identifier | TokenKind::Text => p.text,
+    }
 }
