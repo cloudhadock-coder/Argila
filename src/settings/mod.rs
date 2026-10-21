@@ -17,6 +17,7 @@ pub struct Settings {
     pub layout: LayoutSettings,
     pub editor: EditorSettings,
     pub recent: RecentSettings,
+    pub session: SessionSettings,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -117,6 +118,27 @@ impl Default for EditorSettings {
 pub struct RecentSettings {
     pub files: Vec<String>,
     pub projects: Vec<String>,
+}
+
+/// Ultima sessao: projeto, arquivos abertos e estado do Project Explorer.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionSettings {
+    pub project: Option<String>,
+    pub files: Vec<SessionFile>,
+    pub active: Option<String>,
+    /// Id do item selecionado no Project Explorer.
+    pub selected: Option<String>,
+    /// Ids dos nos expandidos no Project Explorer.
+    pub expanded: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionFile {
+    pub path: String,
+    /// Linha do cursor (base 1).
+    pub line: usize,
 }
 
 impl RecentSettings {
