@@ -2,6 +2,8 @@
 //! viram acoes, sempre passando pelo mesmo caminho (menu, barra, atalho ou botao).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::Instant;
 
 use eframe::egui::{self, Color32, FontId, Id, Margin, RichText, Stroke, ViewportCommand};
@@ -11,14 +13,26 @@ use crate::diagnostics::{Level, MessageLog};
 use crate::editor::document::{Document, SaveError, SaveOptions};
 use crate::editor::view::{EditorStyle, EditorView};
 use crate::filesystem::{self, encoding};
-use crate::settings::{BottomTab, LeftTab, Settings, SettingsStore};
+use crate::projects::files::{self, Plan};
+use crate::projects::outline::{self, Outline};
+use crate::projects::{Project, ProjectKind, related_file};
+use crate::settings::{BottomTab, LeftTab, SessionFile, SessionSettings, Settings, SettingsStore};
 use crate::shortcuts::{Availability, Command, KeyChord, Keymap, USER_KEYMAP_FILE};
+use crate::syntax::Language;
 use crate::themes::{self, EARTHY, Palette};
+use crate::ui::explorer::{ExplorerAction, ExplorerState, StructureInfo};
+use crate::ui::inspector::InspectorItem;
 use crate::ui::{self, console, dialogs, explorer, inspector, statusbar, toolbar, welcome};
 
 pub struct EditorTab {
+    pub id: u64,
     pub doc: Document,
     pub view: EditorView,
+    outline: Option<Arc<Outline>>,
+    outline_version: Option<u64>,
+    outline_busy: bool,
+    seen_version: u64,
+    changed_at: f64,
 }
 
 /// Abas da area central. O designer de formularios entra na Fase 4.
@@ -39,6 +53,13 @@ impl Tab {
     fn is_modified(&self) -> bool {
         matches!(self, Tab::Editor(e) if e.doc.is_modified())
     }
+
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Tab::Editor(e) => Some(&e.doc.path),
+            Tab::Welcome => None,
+        }
+    }
 }
 
 /// O que continuar depois que um salvamento pedido por um dialogo der certo.
@@ -47,12 +68,14 @@ enum Then {
     Nothing,
     CloseTab,
     Exit,
+    CloseProject,
 }
 
-/// Dialogos modais: nada e descartado ou sobrescrito sem o usuario escolher.
+/// Dialogos modais: nada e descartado, sobrescrito ou alterado sem o usuario escolher.
 enum Prompt {
     CloseModified(usize),
     ExitModified,
+    CloseProjectModified,
     Unencodable {
         tab: usize,
         message: String,
@@ -67,6 +90,19 @@ enum Prompt {
         then: Then,
     },
     GotoLine(String),
+    UnitList {
+        forms: bool,
+        filter: String,
+    },
+    NewUnit {
+        name: String,
+        add: bool,
+    },
+    Rename {
+        pas: PathBuf,
+        name: String,
+    },
+    Confirm(Box<Plan>),
 }
 
 enum SaveResult {
@@ -82,6 +118,13 @@ struct Flash {
     until: f64,
 }
 
+/// Projeto sendo lido em segundo plano.
+struct Loading {
+    path: PathBuf,
+    name: String,
+    rx: Receiver<Result<Project, String>>,
+}
+
 /// Estatistica de tempo de quadro (ARGILA_PERF=1 imprime no stderr a cada 2 s).
 #[derive(Default)]
 struct Perf {
@@ -92,6 +135,7 @@ struct Perf {
 }
 
 pub struct ArgilaApp {
+    ctx: egui::Context,
     palette: Palette,
     settings: Settings,
     store: SettingsStore,
@@ -101,8 +145,15 @@ pub struct ArgilaApp {
     no_bom_default: &'static Encoding,
     tabs: Vec<Tab>,
     active: usize,
-    next_view: u64,
+    next_id: u64,
     cursor: Option<(usize, usize)>,
+    project: Option<Project>,
+    loading: Option<Loading>,
+    explorer: ExplorerState,
+    outline_tx: Sender<(u64, u64, Outline)>,
+    outline_rx: Receiver<(u64, u64, Outline)>,
+    options: dialogs::OptionsState,
+    show_options: bool,
     inspector_filter: String,
     flash: Option<Flash>,
     pending: Vec<Command>,
@@ -115,6 +166,21 @@ pub struct ArgilaApp {
     perf: Option<Perf>,
     /// Momento da ultima alteracao ainda nao gravada (gravacao com atraso para nao martelar o disco).
     dirty_since: Option<f64>,
+}
+
+fn is_project_path(path: &Path) -> bool {
+    path.is_dir()
+        || matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("dproj" | "dpr" | "dpk")
+        )
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
 }
 
 impl ArgilaApp {
@@ -166,7 +232,10 @@ impl ArgilaApp {
             encoding::TextEncoding::Legacy(no_bom_default).label()
         ));
 
+        let (outline_tx, outline_rx) = channel();
+        let session = settings.session.clone();
         let mut app = Self {
+            ctx: cc.egui_ctx.clone(),
             palette,
             settings,
             store,
@@ -176,8 +245,15 @@ impl ArgilaApp {
             no_bom_default,
             tabs: vec![Tab::Welcome],
             active: 0,
-            next_view: 0,
+            next_id: 0,
             cursor: None,
+            project: None,
+            loading: None,
+            explorer: ExplorerState::default(),
+            outline_tx,
+            outline_rx,
+            options: dialogs::OptionsState::default(),
+            show_options: false,
             inspector_filter: String::new(),
             flash: None,
             pending: Vec::new(),
@@ -189,10 +265,80 @@ impl ArgilaApp {
             perf: std::env::var_os("ARGILA_PERF").map(|_| Perf::default()),
             dirty_since: None,
         };
-        for file in files {
-            app.open_path(&file, 0.0);
-        }
+        app.restore_session(&session, files);
         app
+    }
+
+    /// Ultimo projeto, arquivos abertos (com a linha do cursor) e estado da arvore.
+    /// Arquivos da linha de comando vem depois; um projeto na linha de comando substitui o da sessao.
+    fn restore_session(&mut self, session: &SessionSettings, cli: Vec<PathBuf>) {
+        self.explorer.selected = session.selected.clone();
+        self.explorer.expanded = session.expanded.iter().cloned().collect();
+        let cli_project = cli.iter().find(|p| is_project_path(p)).cloned();
+        match cli_project.or_else(|| session.project.as_ref().map(PathBuf::from)) {
+            Some(p) if p.exists() => self.load_project(p),
+            Some(p) => self
+                .log
+                .warning(format!("Last project not found: {}", p.display())),
+            None => {}
+        }
+        for f in &session.files {
+            let path = Path::new(&f.path);
+            if !path.is_file() {
+                self.log.warning(format!(
+                    "Previously open file not found: {}",
+                    path.display()
+                ));
+                continue;
+            }
+            self.open_path(path, 0.0);
+            if let Some(ed) = self.active_editor() {
+                ed.view.goto(&mut ed.doc, f.line.saturating_sub(1), 0);
+            }
+        }
+        if let Some(active) = &session.active {
+            if let Some(i) = self
+                .tabs
+                .iter()
+                .position(|t| t.path().is_some_and(|p| same_path(p, Path::new(active))))
+            {
+                self.active = i;
+            }
+        }
+        for path in cli.iter().filter(|p| !is_project_path(p)) {
+            self.open_path(path, 0.0);
+        }
+    }
+
+    fn session_snapshot(&self) -> SessionSettings {
+        let project = self
+            .project
+            .as_ref()
+            .map(|p| &p.file)
+            .or(self.loading.as_ref().map(|l| &l.path));
+        let mut expanded: Vec<String> = self.explorer.expanded.iter().cloned().collect();
+        expanded.sort();
+        SessionSettings {
+            project: project.map(|p| p.display().to_string()),
+            files: self
+                .tabs
+                .iter()
+                .filter_map(|t| match t {
+                    Tab::Editor(e) => Some(SessionFile {
+                        path: e.doc.path.display().to_string(),
+                        line: e.doc.buffer.line_of(e.doc.buffer.selection.head) + 1,
+                    }),
+                    Tab::Welcome => None,
+                })
+                .collect(),
+            active: self
+                .tabs
+                .get(self.active)
+                .and_then(Tab::path)
+                .map(|p| p.display().to_string()),
+            selected: self.explorer.selected.clone(),
+            expanded,
+        }
     }
 
     fn keymap_path() -> PathBuf {
@@ -206,24 +352,63 @@ impl ArgilaApp {
         }
     }
 
+    fn active_path(&self) -> Option<&Path> {
+        self.tabs.get(self.active).and_then(Tab::path)
+    }
+
     fn has_editor(&self) -> bool {
         matches!(self.tabs.get(self.active), Some(Tab::Editor(_)))
+    }
+
+    /// Unit do Project Explorer selecionada (ou a do arquivo ativo).
+    fn target_unit(&self) -> Option<&crate::projects::ProjectUnit> {
+        let project = self.project.as_ref()?;
+        let selected = self
+            .explorer
+            .selected
+            .as_deref()
+            .and_then(|s| s.strip_prefix("unit:").or_else(|| s.strip_prefix("dfm:")));
+        match selected {
+            Some(name) => project.units.iter().find(|u| u.name.to_lowercase() == name),
+            None => self.active_path().and_then(|p| project.unit_for_path(p)),
+        }
+    }
+
+    /// .pas alvo de "Rename Unit": a unit selecionada ou o .pas ativo.
+    fn rename_target(&self) -> Option<PathBuf> {
+        if let Some(u) = self.target_unit().filter(|u| u.exists) {
+            return u.pas.clone();
+        }
+        self.active_path()
+            .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pas")))
+            .map(Path::to_path_buf)
     }
 
     /// Unico lugar que decide se um comando pode rodar.
     pub fn availability(&self, cmd: Command) -> Availability {
         use Command::*;
-        match cmd {
-            Exit | ProjectManager | Structure | ObjectInspector | Messages | Welcome | ExportKeymap
-            | OpenSettingsFolder | KeyboardShortcuts | About | OpenFile => Availability::Ready,
-            CloseTab if !self.tabs.is_empty() => Availability::Ready,
-            Save | SaveAll | Undo | Redo | Find | Replace | SearchAgain | GotoLine | ToggleComment | CloseTab => {
-                if self.has_editor() || (cmd == SaveAll && self.tabs.iter().any(Tab::is_modified)) {
-                    Availability::Ready
-                } else {
-                    Availability::Unavailable("Open a file first (File ▸ Open, Ctrl+O).".to_owned())
-                }
+        let needs = |ok: bool, why: &str| {
+            if ok {
+                Availability::Ready
+            } else {
+                Availability::Unavailable(why.to_owned())
             }
+        };
+        let editable_project = self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.kind != ProjectKind::Folder);
+        match cmd {
+            Exit | ProjectManager | Structure | ObjectInspector | Messages | Welcome | ExportKeymap | OpenSettingsFolder
+            | KeyboardShortcuts | About | OpenFile | OpenProject | OpenFolder | NewUnit => Availability::Ready,
+            CloseTab => needs(!self.tabs.is_empty(), "No open tabs."),
+            CloseProject | ViewUnits | ViewForms | ProjectOptions => needs(self.project.is_some(), "No project open (File ▸ Open Project, Ctrl+F11)."),
+            AddToProject => needs(editable_project, "Open a .dproj, .dpr or .dpk project first."),
+            RemoveFromProject => needs(editable_project && self.target_unit().is_some(), "Select a unit of the project first."),
+            RenameUnit => needs(self.rename_target().is_some(), "Select a unit or open a .pas file first."),
+            SaveAll => needs(self.tabs.iter().any(Tab::is_modified) || self.has_editor(), "Open a file first (File ▸ Open, Ctrl+O)."),
+            Save | Undo | Redo | Find | Replace | SearchAgain | GotoLine | ToggleComment | ToggleFormUnit | DeclImplToggle
+            | FindDeclaration => needs(self.has_editor(), "Open a file first (File ▸ Open, Ctrl+O)."),
             Compile | Build | Run | RunWithoutDebugging => Availability::Unavailable(
                 "No compiler configured. DCC32/DCC64 integration is planned for phase 6 and needs a licensed Delphi installation."
                     .to_owned(),
@@ -234,11 +419,8 @@ impl ArgilaApp {
 
     /// Fase do roteiro em que o comando passa a funcionar (para a mensagem de "nao implementado").
     fn planned_phase(cmd: Command) -> u8 {
-        use Command::*;
         match cmd {
-            NewUnit | OpenProject | OpenFolder => 3,
-            ToggleFormUnit => 4,
-            CodeCompletion | ClassCompletion | DeclImplToggle | FindInFiles | FindDeclaration => 5,
+            Command::CodeCompletion | Command::ClassCompletion | Command::FindInFiles => 5,
             _ => 6,
         }
     }
@@ -289,6 +471,40 @@ impl ArgilaApp {
         match cmd {
             Command::Exit => ctx.send_viewport_cmd(ViewportCommand::Close),
             Command::OpenFile => self.open_dialog(now),
+            Command::OpenProject => {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Open Project")
+                    .add_filter("Delphi projects", &["dproj", "dpr", "dpk"])
+                    .add_filter("All files", &["*"]);
+                if let Some(dir) = self
+                    .settings
+                    .recent
+                    .projects
+                    .first()
+                    .and_then(|p| Path::new(p).parent())
+                    .filter(|d| d.is_dir())
+                {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(path) = dialog.pick_file() {
+                    self.load_project(path);
+                }
+            }
+            Command::OpenFolder => {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title("Open Folder")
+                    .pick_folder()
+                {
+                    self.load_project(dir);
+                }
+            }
+            Command::CloseProject => {
+                if self.project_tabs_modified() {
+                    self.prompt = Some(Prompt::CloseProjectModified);
+                } else {
+                    self.close_project_now(now);
+                }
+            }
             Command::Save => {
                 self.save_tab(self.active, SaveOptions::default(), Then::Nothing, now);
             }
@@ -313,6 +529,60 @@ impl ArgilaApp {
                 }
             }
             Command::GotoLine => self.prompt = Some(Prompt::GotoLine(String::new())),
+            Command::ToggleFormUnit => self.toggle_form_unit(now),
+            Command::DeclImplToggle => self.toggle_decl_impl(now),
+            Command::FindDeclaration => self.find_declaration(now),
+            Command::ViewUnits => {
+                self.prompt = Some(Prompt::UnitList {
+                    forms: false,
+                    filter: String::new(),
+                })
+            }
+            Command::ViewForms => {
+                self.prompt = Some(Prompt::UnitList {
+                    forms: true,
+                    filter: String::new(),
+                })
+            }
+            Command::NewUnit => {
+                let add = self
+                    .project
+                    .as_ref()
+                    .is_some_and(|p| p.kind != ProjectKind::Folder);
+                self.prompt = Some(Prompt::NewUnit {
+                    name: self.next_unit_name(),
+                    add,
+                });
+            }
+            Command::AddToProject => {
+                let dir = self.project.as_ref().map(|p| p.dir.clone());
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Add to Project")
+                    .add_filter("Delphi units", &["pas"]);
+                if let Some(dir) = dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let (Some(pas), Some(project)) = (dialog.pick_file(), &self.project) {
+                    let plan = files::plan_add_unit(project, &pas);
+                    self.confirm_plan(plan, now);
+                }
+            }
+            Command::RemoveFromProject => {
+                if let (Some(project), Some(unit)) = (&self.project, self.target_unit()) {
+                    let plan = files::plan_remove_unit(project, unit);
+                    self.confirm_plan(plan, now);
+                }
+            }
+            Command::RenameUnit => {
+                if let Some(pas) = self.rename_target() {
+                    let name = pas
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.prompt = Some(Prompt::Rename { pas, name });
+                }
+            }
+            Command::ProjectOptions => self.show_options = true,
             Command::Welcome => match self.tabs.iter().position(|t| matches!(t, Tab::Welcome)) {
                 Some(i) => self.active = i,
                 None => {
@@ -343,6 +613,519 @@ impl ArgilaApp {
         }
     }
 
+    // ------------------------------------------------------------------ projeto
+
+    fn load_project(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let (tx, rx) = channel();
+        let (ctx, target) = (self.ctx.clone(), path.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Project::load(&target));
+            ctx.request_repaint();
+        });
+        self.loading = Some(Loading { path, name, rx });
+    }
+
+    fn poll_loading(&mut self, now: f64) {
+        let Some(loading) = &self.loading else { return };
+        let result = match loading.rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("the project loader stopped unexpectedly".to_owned())
+            }
+        };
+        let path = self.loading.take().map(|l| l.path).unwrap_or_default();
+        match result {
+            Ok(project) => {
+                let forms = project.units.iter().filter(|u| u.dfm.is_some()).count();
+                let text = format!(
+                    "Opened project {} ({}): {} units, {forms} with form, {} missing, in {:.0} ms.",
+                    project.name,
+                    project.kind.label(),
+                    project.units.len(),
+                    project.missing_count(),
+                    project.load_ms
+                );
+                self.notify(
+                    if project.problems.is_empty() {
+                        Level::Info
+                    } else {
+                        Level::Warning
+                    },
+                    text,
+                    now,
+                );
+                for problem in project.problems.iter().take(40) {
+                    self.log.warning(problem.clone());
+                }
+                if project.problems.len() > 40 {
+                    self.log.warning(format!(
+                        "… and {} more problems.",
+                        project.problems.len() - 40
+                    ));
+                }
+                if self.explorer.expanded.is_empty() {
+                    self.explorer
+                        .expanded
+                        .extend(["project".to_owned(), "units".to_owned()]);
+                }
+                self.settings
+                    .recent
+                    .push_project(&project.file.display().to_string());
+                self.project = Some(project);
+                self.mark_dirty(now);
+            }
+            Err(e) => self.notify(
+                Level::Error,
+                format!("Could not open project {}: {e}", path.display()),
+                now,
+            ),
+        }
+    }
+
+    fn belongs_to_project(project: &Project, path: &Path) -> bool {
+        project.unit_for_path(path).is_some()
+            || [&project.source, &project.dproj_path]
+                .iter()
+                .any(|p| p.as_deref().is_some_and(|p| same_path(p, path)))
+    }
+
+    fn project_tabs_modified(&self) -> bool {
+        let Some(project) = &self.project else {
+            return false;
+        };
+        self.tabs.iter().any(|t| {
+            t.is_modified()
+                && t.path()
+                    .is_some_and(|p| Self::belongs_to_project(project, p))
+        })
+    }
+
+    /// Fecha o projeto e as abas dos arquivos dele (a aplicacao continua aberta).
+    fn close_project_now(&mut self, now: f64) {
+        let Some(project) = self.project.take() else {
+            return;
+        };
+        self.tabs.retain(|t| {
+            !t.path()
+                .is_some_and(|p| Self::belongs_to_project(&project, p))
+        });
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.explorer.selected = None;
+        self.show_options = false;
+        self.notify(
+            Level::Info,
+            format!("Closed project {}.", project.name),
+            now,
+        );
+        self.mark_dirty(now);
+    }
+
+    fn next_unit_name(&self) -> String {
+        let dir = self.new_unit_dir();
+        (1..1000)
+            .map(|i| format!("Unit{i}"))
+            .find(|n| {
+                let free_on_disk = dir
+                    .as_ref()
+                    .is_none_or(|d| !d.join(format!("{n}.pas")).exists());
+                let free_in_project = self
+                    .project
+                    .as_ref()
+                    .is_none_or(|p| !p.units.iter().any(|u| u.name.eq_ignore_ascii_case(n)));
+                free_on_disk && free_in_project
+            })
+            .unwrap_or_else(|| "UnitNova".to_owned())
+    }
+
+    fn new_unit_dir(&self) -> Option<PathBuf> {
+        self.project.as_ref().map(|p| p.dir.clone()).or_else(|| {
+            self.active_path()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+    }
+
+    fn confirm_plan(&mut self, plan: Result<Plan, String>, now: f64) {
+        match plan {
+            Ok(plan) => self.prompt = Some(Prompt::Confirm(Box::new(plan))),
+            Err(e) => self.notify(Level::Error, e, now),
+        }
+    }
+
+    /// Grava um plano confirmado. Abas abertas acompanham os arquivos (recarregados ou renomeados).
+    fn apply_plan(&mut self, plan: &Plan, now: f64) {
+        let touched: Vec<&Path> = plan
+            .edits
+            .iter()
+            .map(|e| e.path.as_path())
+            .chain(plan.moves.iter().map(|m| m.0.as_path()))
+            .collect();
+        if let Some(t) = self.tabs.iter().find(|t| {
+            t.is_modified()
+                && t.path()
+                    .is_some_and(|p| touched.iter().any(|x| same_path(x, p)))
+        }) {
+            let text = format!(
+                "Save or close {} first: it has unsaved changes and would be changed by \"{}\".",
+                t.title(),
+                plan.title
+            );
+            self.notify(Level::Warning, text, now);
+            return;
+        }
+        match files::apply(plan, &filesystem::config_dir().join("backups")) {
+            Ok(backup) => {
+                self.log.info(format!("{}:", plan.title));
+                for line in plan.describe() {
+                    self.log.info(format!("  {line}"));
+                }
+                if let Some(dir) = backup {
+                    self.log.info(format!(
+                        "  Backup of the previous versions: {}",
+                        dir.display()
+                    ));
+                }
+                let no_bom = self.no_bom_default;
+                for tab in &mut self.tabs {
+                    let Tab::Editor(e) = tab else { continue };
+                    let moved = plan
+                        .moves
+                        .iter()
+                        .find(|(from, _)| same_path(from, &e.doc.path))
+                        .map(|m| m.1.clone());
+                    let edited = plan.edits.iter().any(|x| same_path(&x.path, &e.doc.path));
+                    if moved.is_some() || edited {
+                        let path = moved.unwrap_or_else(|| e.doc.path.clone());
+                        if let Ok(doc) = Document::open(&path, no_bom) {
+                            e.doc = doc;
+                            e.view.reset();
+                            e.outline_version = None;
+                        }
+                    }
+                }
+                if let Some((created, _)) = plan.creates.first() {
+                    let created = created.clone();
+                    self.open_path(&created, now);
+                }
+                self.notify(Level::Info, format!("{}: done.", plan.title), now);
+                if let Some(project) = &self.project {
+                    let file = project.file.clone();
+                    self.load_project(file);
+                }
+            }
+            Err(e) => self.notify(Level::Error, format!("{}: {e}", plan.title), now),
+        }
+    }
+
+    // ------------------------------------------------------------------ navegacao
+
+    fn toggle_form_unit(&mut self, now: f64) {
+        let Some(path) = self.active_path().map(Path::to_path_buf) else {
+            return;
+        };
+        match related_file(&path) {
+            Some(other) => self.open_path(&other, now),
+            None => {
+                let what = if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dfm"))
+                {
+                    ".pas"
+                } else {
+                    ".dfm"
+                };
+                self.notify(
+                    Level::Hint,
+                    format!("{} has no {what} next to it.", path.display()),
+                    now,
+                );
+            }
+        }
+    }
+
+    /// Outline do editor ativo; se estiver desatualizado, calcula agora (acao explicita do usuario).
+    fn fresh_outline(&mut self) -> Option<Arc<Outline>> {
+        let ed = self.active_editor()?;
+        let version = ed.doc.buffer.version();
+        if ed.outline_version != Some(version) || ed.outline.is_none() {
+            let text = ed.doc.buffer.text();
+            let o = if ed.doc.language == Language::Dfm {
+                outline::dfm(&text)
+            } else {
+                outline::pascal(&text)
+            };
+            ed.outline = Some(Arc::new(o));
+            ed.outline_version = Some(version);
+        }
+        ed.outline.clone()
+    }
+
+    fn toggle_decl_impl(&mut self, now: f64) {
+        let Some(o) = self.fresh_outline() else {
+            return;
+        };
+        let Some(ed) = self.active_editor() else {
+            return;
+        };
+        let line = ed.doc.buffer.line_of(ed.doc.buffer.selection.head);
+        match o.decl_impl_target(line) {
+            Some((l, c)) => ed.view.goto(&mut ed.doc, l, c),
+            None => self.notify(
+                Level::Hint,
+                "No method declaration or implementation at the cursor.".to_owned(),
+                now,
+            ),
+        }
+    }
+
+    /// Alt+Up / Ctrl+clique: unit do uses abre o arquivo; tipo ou metodo desta unit vai ate a declaracao.
+    fn find_declaration(&mut self, now: f64) {
+        let Some(o) = self.fresh_outline() else {
+            return;
+        };
+        let Some(ed) = self.active_editor() else {
+            return;
+        };
+        let Some((word, line, col)) = EditorView::word_at_caret(&ed.doc) else {
+            return;
+        };
+        let dir = ed
+            .doc
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let unit_name = o.used_unit_at(line, col).map(str::to_owned).or_else(|| {
+            self.project
+                .as_ref()
+                .and_then(|p| p.units.iter().find(|u| u.name.eq_ignore_ascii_case(&word)))
+                .map(|u| u.name.clone())
+        });
+        if let Some(name) = unit_name {
+            let file = self
+                .project
+                .as_ref()
+                .and_then(|p| p.resolve_unit(&name))
+                .or_else(|| Some(dir.join(format!("{name}.pas"))).filter(|p| p.is_file()));
+            match file {
+                Some(f) => self.open_path(&f, now),
+                None => self.notify(
+                    Level::Hint,
+                    format!("{name} is not part of the project or its search path (library unit)."),
+                    now,
+                ),
+            }
+            return;
+        }
+        let short = word.rsplit('.').next().unwrap_or(&word).to_owned();
+        match o.find_symbol(&word).or_else(|| o.find_symbol(&short)) {
+            Some((l, c)) => {
+                if let Some(ed) = self.active_editor() {
+                    ed.view.goto(&mut ed.doc, l, c);
+                }
+            }
+            None => self.notify(Level::Hint, format!("Declaration of {word} not found in this unit (project-wide symbols come in phase 5)."), now),
+        }
+    }
+
+    /// Outline da aba ativa em segundo plano, 0,4 s depois da ultima edicao.
+    fn update_outline(&mut self, now: f64) {
+        while let Ok((id, version, outline)) = self.outline_rx.try_recv() {
+            for tab in &mut self.tabs {
+                if let Tab::Editor(e) = tab {
+                    if e.id == id {
+                        e.outline = Some(Arc::new(outline));
+                        e.outline_version = Some(version);
+                        e.outline_busy = false;
+                        break;
+                    }
+                }
+            }
+        }
+        let (ctx, tx) = (self.ctx.clone(), self.outline_tx.clone());
+        let Some(Tab::Editor(e)) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let version = e.doc.buffer.version();
+        if version != e.seen_version {
+            e.seen_version = version;
+            e.changed_at = now;
+        }
+        if e.outline_busy
+            || e.outline_version == Some(version)
+            || e.doc.language == Language::PlainText
+        {
+            return;
+        }
+        if e.outline.is_some() && now - e.changed_at < 0.4 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(450));
+            return;
+        }
+        let (text, language, id) = (e.doc.buffer.text(), e.doc.language, e.id);
+        e.outline_busy = true;
+        std::thread::spawn(move || {
+            let o = if language == Language::Dfm {
+                outline::dfm(&text)
+            } else {
+                outline::pascal(&text)
+            };
+            let _ = tx.send((id, version, o));
+            ctx.request_repaint();
+        });
+    }
+
+    fn inspector_item(&self) -> Option<InspectorItem> {
+        let project = self.project.as_ref()?;
+        let sel = self.explorer.selected.as_deref()?;
+        let yes = |b: bool| if b { "Yes" } else { "No" }.to_owned();
+        let path = |p: &Option<PathBuf>| {
+            p.as_ref()
+                .map_or("—".to_owned(), |p| p.display().to_string())
+        };
+        if sel == "project" {
+            let d = project.dproj.as_ref();
+            return Some(InspectorItem {
+                title: project.name.clone(),
+                class: project.kind.label().to_owned(),
+                rows: vec![
+                    ("File".into(), project.file.display().to_string()),
+                    ("Folder".into(), project.dir.display().to_string()),
+                    ("Main source".into(), path(&project.source)),
+                    (".dproj".into(), path(&project.dproj_path)),
+                    ("Units".into(), project.units.len().to_string()),
+                    (
+                        "With form".into(),
+                        project
+                            .units
+                            .iter()
+                            .filter(|u| u.dfm.is_some())
+                            .count()
+                            .to_string(),
+                    ),
+                    ("Missing".into(), project.missing_count().to_string()),
+                    (
+                        "Library units".into(),
+                        project
+                            .units
+                            .iter()
+                            .filter(|u| u.is_library())
+                            .count()
+                            .to_string(),
+                    ),
+                    (
+                        "Configurations".into(),
+                        d.map(|d| d.config_names().join(", ")).unwrap_or_default(),
+                    ),
+                    (
+                        "Platforms".into(),
+                        d.map(|d| d.platform_names().join(", ")).unwrap_or_default(),
+                    ),
+                    (
+                        "ProjectVersion".into(),
+                        d.and_then(|d| d.global("ProjectVersion"))
+                            .unwrap_or("—")
+                            .to_owned(),
+                    ),
+                    ("Problems".into(), project.problems.len().to_string()),
+                    ("Load time".into(), format!("{:.0} ms", project.load_ms)),
+                ],
+            });
+        }
+        if let Some(name) = sel
+            .strip_prefix("unit:")
+            .or_else(|| sel.strip_prefix("dfm:"))
+        {
+            let u = project
+                .units
+                .iter()
+                .find(|u| u.name.to_lowercase() == name)?;
+            let status = if u.is_missing() {
+                "Missing"
+            } else if u.is_library() {
+                "Library unit (outside the project)"
+            } else {
+                "OK"
+            };
+            return Some(InspectorItem {
+                title: u.name.clone(),
+                class: if sel.starts_with("dfm:") {
+                    "Form file".into()
+                } else {
+                    "Unit".into()
+                },
+                rows: vec![
+                    ("Status".into(), status.to_owned()),
+                    ("File".into(), path(&u.pas)),
+                    (
+                        "Declared path".into(),
+                        u.declared_path.clone().unwrap_or_else(|| "—".into()),
+                    ),
+                    ("Form".into(), u.form.clone().unwrap_or_else(|| "—".into())),
+                    (
+                        "Form type".into(),
+                        u.form_type.clone().unwrap_or_else(|| "—".into()),
+                    ),
+                    ("DFM".into(), path(&u.dfm)),
+                    ("In uses clause".into(), yes(u.in_source)),
+                    ("In .dproj".into(), yes(u.in_dproj)),
+                    ("Conditional ($IF)".into(), yes(u.conditional)),
+                ],
+            });
+        }
+        if let Some(p) = sel
+            .strip_prefix("other:")
+            .or_else(|| sel.strip_prefix("file:"))
+        {
+            let file = PathBuf::from(p);
+            let size = std::fs::metadata(&file)
+                .map(|m| format!("{} bytes", m.len()))
+                .unwrap_or_else(|_| "—".into());
+            let role = project
+                .others
+                .iter()
+                .find(|o| same_path(&o.path, &file))
+                .map_or("project file", |o| o.role);
+            return Some(InspectorItem {
+                title: file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                class: role.to_owned(),
+                rows: vec![
+                    ("File".into(), p.to_owned()),
+                    ("Exists".into(), yes(file.exists())),
+                    ("Size".into(), size),
+                ],
+            });
+        }
+        let d = project.dproj.as_ref()?;
+        if let Some(name) = sel.strip_prefix("configs:") {
+            let c = d.configurations.iter().find(|c| c.name == name)?;
+            return Some(InspectorItem {
+                title: c.name.clone(),
+                class: "Build configuration".into(),
+                rows: vec![
+                    ("Key".into(), c.key.clone()),
+                    (
+                        "Parent".into(),
+                        c.parent.clone().unwrap_or_else(|| "—".into()),
+                    ),
+                ],
+            });
+        }
+        let name = sel.strip_prefix("platforms:")?;
+        Some(InspectorItem {
+            title: name.to_owned(),
+            class: "Target platform".into(),
+            rows: vec![("Active".into(), "Yes".into())],
+        })
+    }
+
     // ------------------------------------------------------------------ arquivos
 
     fn open_dialog(&mut self, now: f64) {
@@ -369,10 +1152,22 @@ impl ArgilaApp {
         }
     }
 
+    /// Projeto (.dproj/.dpr/.dpk/pasta) abre como projeto; o resto abre no editor.
+    fn open_any(&mut self, path: &Path, now: f64) {
+        if is_project_path(path) {
+            self.load_project(path.to_path_buf());
+        } else {
+            self.open_path(path, now);
+        }
+    }
+
     pub fn open_path(&mut self, path: &Path, now: f64) {
         let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
-        let same = |t: &Tab| matches!(t, Tab::Editor(e) if e.doc.path.as_os_str().eq_ignore_ascii_case(path.as_os_str()));
-        if let Some(i) = self.tabs.iter().position(same) {
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|t| t.path().is_some_and(|p| same_path(p, &path)))
+        {
             self.active = i;
             return;
         }
@@ -401,10 +1196,18 @@ impl ArgilaApp {
                         doc.format.label()
                     ));
                 }
-                self.next_view += 1;
-                let view = EditorView::new(Id::new(("argila_editor", self.next_view)));
-                self.tabs
-                    .push(Tab::Editor(Box::new(EditorTab { doc, view })));
+                self.next_id += 1;
+                let view = EditorView::new(Id::new(("argila_editor", self.next_id)));
+                self.tabs.push(Tab::Editor(Box::new(EditorTab {
+                    id: self.next_id,
+                    doc,
+                    view,
+                    outline: None,
+                    outline_version: None,
+                    outline_busy: false,
+                    seen_version: 0,
+                    changed_at: now,
+                })));
                 self.active = self.tabs.len() - 1;
                 self.settings.recent.push_file(&path.to_string_lossy());
                 self.mark_dirty(now);
@@ -471,9 +1274,13 @@ impl ArgilaApp {
                 }
             }
         }
-        if then == Then::Exit {
-            self.allow_close = true;
-            self.pending_close = true;
+        match then {
+            Then::Exit => {
+                self.allow_close = true;
+                self.pending_close = true;
+            }
+            Then::CloseProject => self.close_project_now(now),
+            Then::Nothing | Then::CloseTab => {}
         }
     }
 
@@ -481,7 +1288,7 @@ impl ArgilaApp {
         match then {
             Then::Nothing => {}
             Then::CloseTab => self.close_tab_now(tab),
-            Then::Exit => self.save_all(Then::Exit, now),
+            Then::Exit | Then::CloseProject => self.save_all(then, now),
         }
     }
 
@@ -599,6 +1406,7 @@ impl ArgilaApp {
     }
 
     fn save_settings(&mut self) {
+        self.settings.session = self.session_snapshot();
         self.dirty_since = None;
         if let Err(e) = self.store.save(&self.settings) {
             self.log.error(format!(
@@ -606,6 +1414,20 @@ impl ArgilaApp {
                 self.store.path().display()
             ));
         }
+    }
+
+    /// A sessao e salva quando muda o que esta aberto; a linha do cursor vai junto no proximo salvamento.
+    fn track_session(&mut self, now: f64) {
+        let snap = self.session_snapshot();
+        let without_lines = |s: &SessionSettings| {
+            let mut s = s.clone();
+            s.files.iter_mut().for_each(|f| f.line = 0);
+            s
+        };
+        if without_lines(&snap) != without_lines(&self.settings.session) {
+            self.mark_dirty(now);
+        }
+        self.settings.session = snap;
     }
 
     fn track_perf(&mut self, frame: &eframe::Frame, now: f64) {
@@ -640,7 +1462,7 @@ impl ArgilaApp {
             .stroke(Stroke::new(1.0_f32, p.border))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for (i, tab) in self.tabs.iter().enumerate() {
                         let mut response = ui::tab_button(ui, &p, i == self.active, &tab.title());
                         if let Tab::Editor(e) = tab {
@@ -671,7 +1493,7 @@ impl ArgilaApp {
                 match welcome::show(ui, &p, &self.keymap, &self.settings.recent) {
                     Some(welcome::WelcomeAction::Command(cmd)) => self.pending.push(cmd),
                     Some(welcome::WelcomeAction::OpenRecent(path)) => {
-                        self.open_path(Path::new(&path), now)
+                        self.open_any(Path::new(&path), now)
                     }
                     None => {}
                 }
@@ -679,6 +1501,9 @@ impl ArgilaApp {
             Some(Tab::Editor(ed)) => {
                 let out = ed.view.show(ui, &mut ed.doc, &style, now, interactive);
                 self.cursor = Some((out.line, out.col));
+                if std::mem::take(&mut ed.view.ctrl_clicked) {
+                    self.pending.push(Command::FindDeclaration);
+                }
             }
             None => ui::empty_state(
                 ui,
@@ -716,9 +1541,15 @@ impl ArgilaApp {
             }
             _ => None,
         };
+        let project = match (&self.project, &self.loading) {
+            (_, Some(l)) => Some(format!("Loading {}…", l.name)),
+            (Some(p), None) => Some(format!("{} · {} units", p.name, p.units.len())),
+            (None, None) => None,
+        };
         let info = statusbar::StatusInfo {
             flash,
             document,
+            project: project.as_deref(),
             ..Default::default()
         };
         let action = egui::TopBottomPanel::bottom("status_bar")
@@ -742,6 +1573,7 @@ impl ArgilaApp {
             statusbar::StatusAction::ReopenWith(enc) => match ed.doc.reopen_as(enc) {
                 Ok(()) => {
                     ed.view.reset();
+                    ed.outline_version = None;
                     let lossy = if ed.doc.lossless {
                         ""
                     } else {
@@ -776,84 +1608,176 @@ impl ArgilaApp {
             return;
         };
         let p = self.palette;
-        let title_of = |tab: usize, tabs: &[Tab]| match tabs.get(tab) {
-            Some(Tab::Editor(e)) => e.doc.file_name(),
-            _ => String::new(),
-        };
+        let title_of = |tab: usize, tabs: &[Tab]| tabs.get(tab).map(Tab::title).unwrap_or_default();
         let modified: Vec<String> = self
             .tabs
             .iter()
             .filter(|t| t.is_modified())
-            .map(|t| t.title())
+            .map(Tab::title)
             .collect();
+        let project_name = self
+            .project
+            .as_ref()
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
         let mut choice = None;
         let mut goto = None;
+        let mut open_unit: Option<PathBuf> = None;
+        let units: Vec<(String, String, PathBuf)> = match &prompt {
+            Prompt::UnitList { forms, filter } => {
+                let needle = filter.trim().to_lowercase();
+                self.project
+                    .iter()
+                    .flat_map(|p| &p.units)
+                    .filter(|u| u.exists && (!forms || u.dfm.is_some()))
+                    .filter(|u| {
+                        needle.is_empty()
+                            || u.name.to_lowercase().contains(&needle)
+                            || u.form
+                                .as_deref()
+                                .is_some_and(|f| f.to_lowercase().contains(&needle))
+                    })
+                    .map(|u| {
+                        let file = if *forms {
+                            u.dfm.clone().unwrap_or_default()
+                        } else {
+                            u.pas.clone().unwrap_or_default()
+                        };
+                        (u.name.clone(), u.form.clone().unwrap_or_default(), file)
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         let modal = egui::Modal::new(Id::new("argila_prompt")).show(ctx, |ui| {
-            ui.set_width(460.0);
-            let (title, body, buttons): (String, String, &[&str]) = match &mut prompt {
-                Prompt::CloseModified(tab) => (
-                    "Save changes?".into(),
-                    format!("{} has unsaved changes.", title_of(*tab, &self.tabs)),
-                    &["Save", "Don't Save", "Cancel"],
-                ),
-                Prompt::ExitModified => (
-                    "Exit Argila?".into(),
-                    format!("These files have unsaved changes:\n{}", modified.join("\n")),
-                    &["Save All and Exit", "Exit Without Saving", "Cancel"],
-                ),
-                Prompt::Unencodable { message, .. } => (
-                    "Character not representable".into(),
-                    format!("{message}\n\nNothing was written. Save as UTF-8 with BOM instead (Delphi 2009+ reads it)?"),
-                    &["Save as UTF-8 BOM", "Cancel"],
-                ),
-                Prompt::ChangedOnDisk { tab, .. } => (
-                    "File changed on disk".into(),
-                    format!("{} was changed by another program since it was opened. Overwrite it?", title_of(*tab, &self.tabs)),
-                    &["Overwrite", "Cancel"],
-                ),
-                Prompt::Lossy { tab, .. } => (
-                    "File was read with replaced bytes".into(),
-                    format!(
-                        "{} contains bytes that could not be decoded in its current encoding. Saving writes the replaced \
-                         characters. Use the encoding menu in the status bar to reopen it correctly first.",
-                        title_of(*tab, &self.tabs)
-                    ),
-                    &["Save Anyway", "Cancel"],
-                ),
+            ui.set_width(480.0);
+            let heading = |ui: &mut egui::Ui, t: &str| {
+                ui.label(RichText::new(t).strong().size(15.0).color(p.text));
+                ui.add_space(4.0);
+            };
+            let buttons = |ui: &mut egui::Ui, labels: &[&str], choice: &mut Option<usize>| {
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    for (i, label) in labels.iter().enumerate() {
+                        if ui.button(*label).clicked() {
+                            *choice = Some(i);
+                        }
+                    }
+                });
+            };
+            let body = |ui: &mut egui::Ui, t: &str| {
+                ui.label(RichText::new(t).color(p.text_weak));
+            };
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            match &mut prompt {
+                Prompt::CloseModified(tab) => {
+                    heading(ui, "Save changes?");
+                    body(ui, &format!("{} has unsaved changes.", title_of(*tab, &self.tabs)));
+                    buttons(ui, &["Save", "Don't Save", "Cancel"], &mut choice);
+                }
+                Prompt::ExitModified | Prompt::CloseProjectModified => {
+                    let exit = matches!(prompt, Prompt::ExitModified);
+                    heading(ui, if exit { "Exit Argila?" } else { "Close project?" });
+                    body(ui, &format!("These files have unsaved changes:\n{}", modified.join("\n")));
+                    let labels: &[&str] = if exit {
+                        &["Save All and Exit", "Exit Without Saving", "Cancel"]
+                    } else {
+                        &["Save All and Close", "Close Without Saving", "Cancel"]
+                    };
+                    buttons(ui, labels, &mut choice);
+                }
+                Prompt::Unencodable { message, .. } => {
+                    heading(ui, "Character not representable");
+                    body(ui, &format!("{message}\n\nNothing was written. Save as UTF-8 with BOM instead (Delphi 2009+ reads it)?"));
+                    buttons(ui, &["Save as UTF-8 BOM", "Cancel"], &mut choice);
+                }
+                Prompt::ChangedOnDisk { tab, .. } => {
+                    heading(ui, "File changed on disk");
+                    body(ui, &format!("{} was changed by another program since it was opened. Overwrite it?", title_of(*tab, &self.tabs)));
+                    buttons(ui, &["Overwrite", "Cancel"], &mut choice);
+                }
+                Prompt::Lossy { tab, .. } => {
+                    heading(ui, "File was read with replaced bytes");
+                    body(
+                        ui,
+                        &format!(
+                            "{} contains bytes that could not be decoded in its current encoding. Saving writes the replaced \
+                             characters. Use the encoding menu in the status bar to reopen it correctly first.",
+                            title_of(*tab, &self.tabs)
+                        ),
+                    );
+                    buttons(ui, &["Save Anyway", "Cancel"], &mut choice);
+                }
                 Prompt::GotoLine(input) => {
-                    ui.label(RichText::new("Go to Line Number").strong().size(15.0));
-                    let field = ui.add(egui::TextEdit::singleline(input).hint_text("Line number").desired_width(f32::INFINITY));
-                    field.request_focus();
-                    if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    heading(ui, "Go to Line Number");
+                    ui.add(egui::TextEdit::singleline(input).hint_text("Line number").desired_width(f32::INFINITY)).request_focus();
+                    if enter {
                         goto = input.trim().parse::<usize>().ok();
                         choice = Some(if goto.is_some() { 0 } else { 1 });
                     }
-                    ui.horizontal(|ui| {
-                        if ui.button("Go").clicked() {
-                            goto = input.trim().parse::<usize>().ok();
-                            choice = Some(0);
-                        }
-                        if ui.button("Cancel").clicked() {
-                            choice = Some(1);
-                        }
-                    });
-                    return;
-                }
-            };
-            ui.label(RichText::new(title).strong().size(15.0).color(p.text));
-            ui.add_space(4.0);
-            ui.label(RichText::new(body).color(p.text_weak));
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                for (i, label) in buttons.iter().enumerate() {
-                    if ui.button(*label).clicked() {
-                        choice = Some(i);
+                    buttons(ui, &["Go", "Cancel"], &mut choice);
+                    if choice == Some(0) {
+                        goto = input.trim().parse::<usize>().ok();
                     }
                 }
-            });
+                Prompt::UnitList { forms, filter } => {
+                    heading(ui, if *forms { "View Form" } else { "View Unit" });
+                    ui.add(egui::TextEdit::singleline(filter).hint_text("Type to filter").desired_width(f32::INFINITY)).request_focus();
+                    ui.label(RichText::new(format!("{} of {}", units.len(), project_name)).size(11.0).color(p.text_weak));
+                    egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                        for (name, form, file) in units.iter().take(500) {
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(false, name).clicked() {
+                                    open_unit = Some(file.clone());
+                                }
+                                ui.label(RichText::new(form).size(11.5).color(p.text_weak));
+                            });
+                        }
+                    });
+                    if enter {
+                        open_unit = units.first().map(|u| u.2.clone());
+                    }
+                    buttons(ui, &["Cancel"], &mut choice);
+                }
+                Prompt::NewUnit { name, add } => {
+                    heading(ui, "New Unit");
+                    ui.add(egui::TextEdit::singleline(name).hint_text("Unit name").desired_width(f32::INFINITY)).request_focus();
+                    if !project_name.is_empty() {
+                        let can_add = self.project.as_ref().is_some_and(|p| p.kind != ProjectKind::Folder);
+                        ui.add_enabled(can_add, egui::Checkbox::new(add, format!("Add to {project_name} (.dpr uses and .dproj)")));
+                    }
+                    let dir = self.new_unit_dir().map(|d| d.display().to_string()).unwrap_or_else(|| "(choose a folder)".into());
+                    body(ui, &format!("Folder: {dir}"));
+                    buttons(ui, &["Create", "Cancel"], &mut choice);
+                    if enter {
+                        choice = Some(0);
+                    }
+                }
+                Prompt::Rename { pas, name } => {
+                    heading(ui, "Rename Unit");
+                    body(ui, &pas.display().to_string());
+                    ui.add(egui::TextEdit::singleline(name).hint_text("New unit name").desired_width(f32::INFINITY)).request_focus();
+                    buttons(ui, &["Continue", "Cancel"], &mut choice);
+                    if enter {
+                        choice = Some(0);
+                    }
+                }
+                Prompt::Confirm(plan) => {
+                    heading(ui, &plan.title);
+                    body(ui, "The following changes will be made (a backup of every edited file is kept):");
+                    for line in plan.describe() {
+                        ui.label(RichText::new(format!("• {line}")).size(12.5));
+                    }
+                    buttons(ui, &["Apply", "Cancel"], &mut choice);
+                }
+            }
         });
-        if modal.should_close() && choice.is_none() {
+        if modal.should_close() && choice.is_none() && open_unit.is_none() {
             choice = Some(usize::MAX); // Esc / clique fora = cancelar
+        }
+        if let Some(file) = open_unit {
+            self.open_path(&file, now);
+            return;
         }
         let Some(choice) = choice else {
             self.prompt = Some(prompt);
@@ -881,6 +1805,8 @@ impl ArgilaApp {
                 self.allow_close = true;
                 self.pending_close = true;
             }
+            (Prompt::CloseProjectModified, 0) => self.save_all(Then::CloseProject, now),
+            (Prompt::CloseProjectModified, 1) => self.close_project_now(now),
             (Prompt::Unencodable { tab, then, .. }, 0) => {
                 if let Some(Tab::Editor(e)) = self.tabs.get_mut(tab) {
                     let line_ending = e.doc.format.line_ending;
@@ -909,6 +1835,28 @@ impl ArgilaApp {
                     ed.view.goto_line(&mut ed.doc, line);
                 }
             }
+            (Prompt::NewUnit { name, add }, 0) => {
+                let dir = self.new_unit_dir().or_else(|| {
+                    rfd::FileDialog::new()
+                        .set_title("Folder for the new unit")
+                        .pick_folder()
+                });
+                if let Some(dir) = dir {
+                    let project = self
+                        .project
+                        .as_ref()
+                        .filter(|p| add && p.kind != ProjectKind::Folder);
+                    match files::plan_new_unit(&dir, name.trim(), project) {
+                        Ok(plan) if plan.edits.is_empty() => self.apply_plan(&plan, now),
+                        other => self.confirm_plan(other, now),
+                    }
+                }
+            }
+            (Prompt::Rename { pas, name }, 0) => {
+                let plan = files::plan_rename_unit(self.project.as_ref(), &pas, name.trim());
+                self.confirm_plan(plan, now);
+            }
+            (Prompt::Confirm(plan), 0) => self.apply_plan(&plan, now),
             _ => {}
         }
     }
@@ -940,6 +1888,8 @@ impl eframe::App for ArgilaApp {
         let now = ctx.input(|i| i.time);
         let p = self.palette;
         self.track_perf(frame, now);
+        self.poll_loading(now);
+        self.update_outline(now);
         self.guard_close(ctx);
         self.collect_shortcuts(ctx);
         self.track_window(ctx, now);
@@ -952,7 +1902,7 @@ impl eframe::App for ArgilaApp {
                     .collect()
             });
             for path in dropped {
-                self.open_path(&path, now);
+                self.open_any(&path, now);
             }
         }
 
@@ -990,6 +1940,7 @@ impl eframe::App for ArgilaApp {
         let before = self.settings.layout.clone();
         // so memoriza larguras durante o arraste (na animacao de abrir/fechar o tamanho e parcial)
         let resizing = ctx.input(|i| i.pointer.any_down() || i.pointer.any_released());
+        let item = self.inspector_item();
         let layout = &mut self.settings.layout;
 
         let bottom = egui::TopBottomPanel::bottom("dock_bottom")
@@ -1009,18 +1960,39 @@ impl eframe::App for ArgilaApp {
             );
         }
 
+        let (structure_title, structure_outline, structure_busy) = match self.tabs.get(self.active)
+        {
+            Some(Tab::Editor(e)) => (e.doc.file_name(), e.outline.clone(), e.outline_busy),
+            _ => (String::new(), None, false),
+        };
+        let structure = StructureInfo {
+            title: &structure_title,
+            outline: structure_outline.as_deref(),
+            busy: structure_busy,
+        };
+        let loading = self.loading.as_ref().map(|l| l.name.clone());
         let left = egui::SidePanel::left("dock_left")
             .resizable(true)
             .default_width(layout.left_width)
             .width_range(160.0..=700.0)
             .frame(dock)
             .show_animated(ctx, layout.show_left, |ui| {
-                explorer::show(ui, &p, &mut layout.left_tab, &self.keymap)
+                explorer::show(
+                    ui,
+                    &p,
+                    &mut layout.left_tab,
+                    &self.keymap,
+                    self.project.as_ref(),
+                    loading.as_deref(),
+                    &mut self.explorer,
+                    &structure,
+                )
             });
+        let mut explorer_actions = Vec::new();
         if let Some(r) = left {
             layout.show_left &= !r.inner.close;
             remember(resizing, &mut layout.left_width, r.response.rect.width());
-            self.pending.extend(r.inner.command);
+            explorer_actions = r.inner.actions;
         }
 
         let right = egui::SidePanel::right("dock_right")
@@ -1034,11 +2006,39 @@ impl eframe::App for ArgilaApp {
                     &p,
                     &mut layout.inspector_tab,
                     &mut self.inspector_filter,
+                    item.as_ref(),
                 )
             });
         if let Some(r) = right {
             layout.show_right &= !r.inner.close;
             remember(resizing, &mut layout.right_width, r.response.rect.width());
+        }
+
+        for action in explorer_actions {
+            match action {
+                ExplorerAction::Command(cmd) => self.pending.push(cmd),
+                ExplorerAction::Open(path) => self.open_path(&path, now),
+                ExplorerAction::Remove(unit) => {
+                    if let Some(project) = &self.project {
+                        if let Some(u) = project.units.iter().find(|u| u.name == unit) {
+                            let plan = files::plan_remove_unit(project, u);
+                            self.confirm_plan(plan, now);
+                        }
+                    }
+                }
+                ExplorerAction::Rename(pas) => {
+                    let name = pas
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.prompt = Some(Prompt::Rename { pas, name });
+                }
+                ExplorerAction::Navigate(line, col) => {
+                    if let Some(ed) = self.active_editor() {
+                        ed.view.goto(&mut ed.doc, line, col);
+                    }
+                }
+            }
         }
 
         egui::CentralPanel::default()
@@ -1064,6 +2064,9 @@ impl eframe::App for ArgilaApp {
             self.store.path(),
             &self.fonts,
         );
+        if let Some(project) = &self.project {
+            dialogs::project_options(ctx, &mut self.show_options, &p, project, &mut self.options);
+        }
 
         self.show_prompt(ctx, now);
         for cmd in std::mem::take(&mut self.pending) {
@@ -1075,6 +2078,7 @@ impl eframe::App for ArgilaApp {
         if self.settings.layout != before {
             self.mark_dirty(now);
         }
+        self.track_session(now);
         if self.dirty_since.is_some_and(|t| now - t > 1.5) {
             self.save_settings();
         } else if self.dirty_since.is_some() {

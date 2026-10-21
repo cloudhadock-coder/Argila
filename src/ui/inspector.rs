@@ -1,6 +1,7 @@
 //! Painel direito: Object Inspector (abas Properties / Events e busca).
 //!
-//! Na Fase 4 recebe o componente selecionado no designer/Structure; por enquanto mostra o estado vazio.
+//! Na Fase 3 mostra as informacoes do item selecionado no Project Explorer; componentes de
+//! formulario chegam com o designer na Fase 4.
 
 use eframe::egui::{self, Margin, RichText, Ui};
 
@@ -8,14 +9,30 @@ use super::{PanelOutput, empty_state, panel_title, tab_button};
 use crate::settings::InspectorTab;
 use crate::themes::Palette;
 
-pub fn show(ui: &mut Ui, p: &Palette, tab: &mut InspectorTab, filter: &mut String) -> PanelOutput {
+/// O que o inspetor mostra: titulo, "classe" e pares nome/valor.
+pub struct InspectorItem {
+    pub title: String,
+    pub class: String,
+    pub rows: Vec<(String, String)>,
+}
+
+pub fn show(
+    ui: &mut Ui,
+    p: &Palette,
+    tab: &mut InspectorTab,
+    filter: &mut String,
+    item: Option<&InspectorItem>,
+) -> PanelOutput {
     let close = panel_title(ui, p, "Object Inspector");
     egui::Frame::new()
         .inner_margin(Margin::same(8))
         .show(ui, |ui| {
+            let selected = item.map_or("(no selection)".to_owned(), |i| {
+                format!("{}: {}", i.title, i.class)
+            });
             ui.add_enabled_ui(false, |ui| {
                 egui::ComboBox::from_id_salt("oi_component")
-                    .selected_text(RichText::new("(no component)").color(p.text_weak))
+                    .selected_text(RichText::new(selected).color(p.text_weak))
                     .width(ui.available_width())
                     .show_ui(ui, |_| {});
             });
@@ -40,12 +57,47 @@ pub fn show(ui: &mut Ui, p: &Palette, tab: &mut InspectorTab, filter: &mut Strin
                     .hint_text(hint)
                     .desired_width(f32::INFINITY),
             );
-            empty_state(
-                ui,
-                p,
-                "No component selected",
-                "Select a component in the form designer or in Structure.",
-            );
+            match (item, *tab) {
+                (None, _) => empty_state(
+                    ui,
+                    p,
+                    "Nothing selected",
+                    "Select a unit, form or the project in the Project Explorer.",
+                ),
+                (Some(_), InspectorTab::Events) => empty_state(
+                    ui,
+                    p,
+                    "No events",
+                    "Form component events arrive with the designer (phase 4).",
+                ),
+                (Some(item), InspectorTab::Properties) => {
+                    let needle = filter.trim().to_lowercase();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            egui::Grid::new("oi_grid")
+                                .striped(true)
+                                .num_columns(2)
+                                .spacing([10.0, 4.0])
+                                .show(ui, |ui| {
+                                    for (name, value) in &item.rows {
+                                        if !needle.is_empty()
+                                            && !name.to_lowercase().contains(&needle)
+                                            && !value.to_lowercase().contains(&needle)
+                                        {
+                                            continue;
+                                        }
+                                        ui.label(RichText::new(name).color(p.text_weak));
+                                        ui.add(
+                                            egui::Label::new(RichText::new(value).color(p.text))
+                                                .wrap(),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+            }
         });
     PanelOutput {
         close,

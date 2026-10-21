@@ -78,6 +78,8 @@ pub struct EditorView {
     last_click: Option<(f64, usize, u8)>,
     page_lines: usize,
     pub find: FindBar,
+    /// Ctrl+clique: o app trata como "ir para a declaracao" (o cursor ja foi posto no lugar).
+    pub ctrl_clicked: bool,
 }
 
 impl EditorView {
@@ -93,6 +95,7 @@ impl EditorView {
             last_click: None,
             page_lines: 30,
             find: FindBar::default(),
+            ctrl_clicked: false,
         }
     }
 
@@ -123,6 +126,35 @@ impl EditorView {
     pub fn toggle_comment(&mut self, doc: &mut Document, now: f64) {
         ops::toggle_comment(&mut doc.buffer, now);
         self.after_edit(ScrollTarget::Nearest);
+    }
+
+    /// Cursor na linha/coluna (base 0), centralizado.
+    pub fn goto(&mut self, doc: &mut Document, line: usize, col: usize) {
+        let pos = doc.buffer.pos(line, col);
+        doc.buffer.set_selection(Selection::caret(pos));
+        self.after_edit(ScrollTarget::Center);
+        self.wants_focus = true;
+    }
+
+    /// Identificador sob o cursor, incluindo pontos (`Vcl.Forms`), e sua linha/coluna inicial.
+    pub fn word_at_caret(doc: &Document) -> Option<(String, usize, usize)> {
+        let (line, col) = doc.buffer.line_col(doc.buffer.selection.head);
+        let chars = crate::syntax::line_chars(doc.buffer.rope(), line);
+        let ok = |c: char| c == '_' || c == '.' || c.is_alphanumeric();
+        let mut s = col.min(chars.len());
+        while s > 0 && ok(chars[s - 1]) {
+            s -= 1;
+        }
+        let mut e = col.min(chars.len());
+        while e < chars.len() && ok(chars[e]) {
+            e += 1;
+        }
+        let word: String = chars[s..e]
+            .iter()
+            .collect::<String>()
+            .trim_matches('.')
+            .to_owned();
+        (!word.is_empty()).then_some((word, line, s))
     }
 
     pub fn goto_line(&mut self, doc: &mut Document, line: usize) {
@@ -254,7 +286,10 @@ impl EditorView {
                 self.page_lines = ((viewport.height() / row_h) as usize)
                     .saturating_sub(1)
                     .max(1);
-                if std::mem::take(&mut self.wants_focus) && interactive {
+                // no quadro em que o foco chega, as teclas ainda sao de quem pediu (ex.: o Enter
+                // que abriu o arquivo pela arvore) e nao podem ser digitadas aqui
+                let just_focused = std::mem::take(&mut self.wants_focus) && interactive;
+                if just_focused {
                     ui.memory_mut(|m| m.request_focus(self.id));
                 }
                 let focused = ui.memory(|m| m.has_focus(self.id));
@@ -269,7 +304,7 @@ impl EditorView {
                 }
                 if interactive {
                     self.mouse(ui, &response, doc, &geo, now);
-                    if focused {
+                    if focused && !just_focused {
                         self.keyboard(ui, doc, &geo, now);
                     }
                 }
@@ -339,6 +374,7 @@ impl EditorView {
                 _ => 1,
             };
             self.last_click = Some((now, at, count));
+            self.ctrl_clicked = mods.ctrl || mods.command;
             let buf = &mut doc.buffer;
             let sel = match count {
                 2 => {

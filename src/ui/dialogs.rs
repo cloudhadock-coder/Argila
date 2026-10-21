@@ -88,3 +88,244 @@ pub fn about_window(
             );
         });
 }
+
+#[derive(Default)]
+pub struct OptionsState {
+    pub config: String,
+    pub platform: String,
+    pub filter: String,
+}
+
+/// Opcoes do projeto, somente leitura: geral, valores efetivos e PropertyGroups como escritos.
+pub fn project_options(
+    ctx: &egui::Context,
+    open: &mut bool,
+    p: &Palette,
+    project: &crate::projects::Project,
+    st: &mut OptionsState,
+) {
+    egui::Window::new(format!("Project Options — {}", project.name))
+        .id(egui::Id::new("project_options"))
+        .open(open)
+        .default_size([680.0, 560.0])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("Read-only: nothing here changes the project files.")
+                    .size(12.0)
+                    .color(p.text_weak),
+            );
+            ui.separator();
+            let d = project.dproj.as_ref();
+            let general: Vec<(&str, String)> = vec![
+                ("Kind", project.kind.label().to_owned()),
+                ("Opened file", project.file.display().to_string()),
+                (
+                    "Main source",
+                    project
+                        .source
+                        .as_ref()
+                        .map(|s| s.display().to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    ".dproj",
+                    project
+                        .dproj_path
+                        .as_ref()
+                        .map(|s| s.display().to_string())
+                        .unwrap_or_else(|| "—".into()),
+                ),
+                (
+                    "ProjectGuid",
+                    d.and_then(|d| d.global("ProjectGuid"))
+                        .unwrap_or("—")
+                        .to_owned(),
+                ),
+                (
+                    "ProjectVersion",
+                    d.and_then(|d| d.global("ProjectVersion"))
+                        .unwrap_or("—")
+                        .to_owned(),
+                ),
+                (
+                    "FrameworkType",
+                    d.and_then(|d| d.global("FrameworkType"))
+                        .unwrap_or("—")
+                        .to_owned(),
+                ),
+                (
+                    "AppType",
+                    d.and_then(|d| d.global("AppType"))
+                        .unwrap_or("—")
+                        .to_owned(),
+                ),
+                (
+                    "Units",
+                    format!(
+                        "{} ({} missing)",
+                        project.units.len(),
+                        project.missing_count()
+                    ),
+                ),
+                (
+                    "Requires",
+                    if project.requires.is_empty() {
+                        "—".into()
+                    } else {
+                        project.requires.join(", ")
+                    },
+                ),
+            ];
+            egui::Grid::new("po_general")
+                .num_columns(2)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    for (k, v) in &general {
+                        ui.label(RichText::new(*k).color(p.text_weak));
+                        ui.add(egui::Label::new(v.as_str()).wrap());
+                        ui.end_row();
+                    }
+                });
+            let Some(d) = d else {
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new("No .dproj: build configurations are not available.")
+                        .color(p.text_weak),
+                );
+                return;
+            };
+            let configs = d.config_names();
+            let platforms = d.platform_names();
+            if st.config.is_empty() || !configs.contains(&st.config) {
+                st.config = d
+                    .global("Config")
+                    .map(str::to_owned)
+                    .filter(|c| configs.contains(c))
+                    .or_else(|| configs.first().cloned())
+                    .unwrap_or_default();
+            }
+            if st.platform.is_empty() || !platforms.contains(&st.platform) {
+                st.platform = platforms
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "Win32".to_owned());
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_label("Configuration")
+                    .selected_text(&st.config)
+                    .show_ui(ui, |ui| {
+                        for c in &configs {
+                            ui.selectable_value(&mut st.config, c.clone(), c);
+                        }
+                    });
+                egui::ComboBox::from_label("Platform")
+                    .selected_text(&st.platform)
+                    .show_ui(ui, |ui| {
+                        for pl in &platforms {
+                            ui.selectable_value(&mut st.platform, pl.clone(), pl);
+                        }
+                    });
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.filter)
+                        .hint_text("Filter")
+                        .desired_width(160.0),
+                );
+            });
+            let effective = d.effective(&st.config, &st.platform);
+            const KEY: &[&str] = &[
+                "DCC_UnitSearchPath",
+                "DCC_Define",
+                "DCC_ExeOutput",
+                "DCC_DcuOutput",
+                "DCC_Namespace",
+                "DCC_BplOutput",
+                "DCC_DcpOutput",
+                "DCC_UsePackage",
+            ];
+            let needle = st.filter.trim().to_lowercase();
+            let shown = |k: &str, v: &str| {
+                needle.is_empty()
+                    || k.to_lowercase().contains(&needle)
+                    || v.to_lowercase().contains(&needle)
+            };
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "EFFECTIVE VALUES · {} · {}",
+                            st.config, st.platform
+                        ))
+                        .size(11.0)
+                        .strong()
+                        .color(p.accent),
+                    );
+                    egui::Grid::new("po_effective")
+                        .striped(true)
+                        .num_columns(2)
+                        .spacing([12.0, 3.0])
+                        .show(ui, |ui| {
+                            let ordered = KEY
+                                .iter()
+                                .filter_map(|k| effective.get_key_value(*k))
+                                .chain(
+                                    effective.iter().filter(|(k, _)| !KEY.contains(&k.as_str())),
+                                );
+                            for (k, v) in ordered.filter(|(k, v)| {
+                                shown(k, v) && k.as_str() != "Config" && k.as_str() != "Platform"
+                            }) {
+                                let strong = KEY.contains(&k.as_str());
+                                ui.label(RichText::new(k).color(if strong {
+                                    p.text
+                                } else {
+                                    p.text_weak
+                                }));
+                                ui.add(egui::Label::new(RichText::new(v).monospace()).wrap());
+                                ui.end_row();
+                            }
+                        });
+                    ui.add_space(8.0);
+                    egui::CollapsingHeader::new("Property groups as written in the .dproj")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            for (i, g) in d.groups.iter().enumerate() {
+                                let label = match (&g.scope, &g.condition) {
+                                    (Some(s), _) => d.scope_label(s),
+                                    (None, Some(c)) => c.clone(),
+                                    (None, None) => "Project".to_owned(),
+                                };
+                                egui::CollapsingHeader::new(format!(
+                                    "{label} ({})",
+                                    g.properties.len()
+                                ))
+                                .id_salt(("po_group", i))
+                                .show(ui, |ui| {
+                                    if let Some(c) = &g.condition {
+                                        ui.label(
+                                            RichText::new(c)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(p.text_weak),
+                                        );
+                                    }
+                                    for (k, v, _) in
+                                        g.properties.iter().filter(|(k, v, _)| shown(k, v))
+                                    {
+                                        ui.label(format!("{k} = {v}"));
+                                    }
+                                });
+                            }
+                            if !d.unknown_elements.is_empty() {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "Kept but not interpreted: {}",
+                                        d.unknown_elements.join(", ")
+                                    ))
+                                    .color(p.text_weak),
+                                );
+                            }
+                        });
+                });
+        });
+}

@@ -38,6 +38,7 @@ commands! {
     Save => "file.save", "Save";
     SaveAll => "file.save_all", "Save All";
     CloseTab => "file.close", "Close";
+    CloseProject => "file.close_project", "Close Project";
     Exit => "file.exit", "Exit";
     Undo => "edit.undo", "Undo";
     Redo => "edit.redo", "Redo";
@@ -56,7 +57,13 @@ commands! {
     ObjectInspector => "view.object_inspector", "Object Inspector";
     Messages => "view.messages", "Messages";
     ToggleFormUnit => "view.toggle_form_unit", "Toggle Form/Unit";
+    ViewUnits => "view.units", "Units...";
+    ViewForms => "view.forms", "Forms...";
     Welcome => "view.welcome", "Welcome Page";
+    AddToProject => "project.add", "Add to Project...";
+    RemoveFromProject => "project.remove", "Remove from Project...";
+    RenameUnit => "project.rename", "Rename Unit...";
+    ProjectOptions => "project.options", "Options...";
     Compile => "project.compile", "Compile";
     Build => "project.build", "Build";
     Run => "run.run", "Run";
@@ -270,6 +277,10 @@ impl Keymap {
             (Structure, k(Key::F11).shift().alt()),
             (ObjectInspector, k(Key::F11)),
             (ToggleFormUnit, k(Key::F12)),
+            (ViewUnits, k(Key::F12).ctrl()),
+            (ViewForms, k(Key::F12).shift()),
+            (AddToProject, k(Key::F11).shift()),
+            (ProjectOptions, k(Key::F11).ctrl().shift()),
             (Compile, k(Key::F9).ctrl()),
             (Build, k(Key::F9).shift()),
             (Run, k(Key::F9)),

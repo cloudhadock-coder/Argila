@@ -9,7 +9,11 @@ use eframe::egui;
 
 fn main() -> eframe::Result<()> {
     // arquivos passados na linha de comando (ou "Abrir com" do Explorer)
-    let files: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let files: Vec<PathBuf> = std::env::args_os()
+        .skip(1)
+        .filter(|a| !a.is_empty())
+        .map(PathBuf::from)
+        .collect();
     let store = SettingsStore::default_location();
     let (settings, warning) = store.load();
     let window = &settings.window;

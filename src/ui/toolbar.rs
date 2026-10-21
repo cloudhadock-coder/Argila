@@ -23,7 +23,7 @@ pub fn menu_bar(ui: &mut Ui, mc: &MenuContext) -> Option<Command> {
             "File",
             &[
                 &[NewUnit, OpenFile, OpenProject, OpenFolder],
-                &[Save, SaveAll, CloseTab],
+                &[Save, SaveAll, CloseTab, CloseProject],
                 &[Exit],
             ],
         );
@@ -59,11 +59,21 @@ pub fn menu_bar(ui: &mut Ui, mc: &MenuContext) -> Option<Command> {
             "View",
             &[
                 &[ProjectManager, Structure, ObjectInspector, Messages],
-                &[ToggleFormUnit],
+                &[ToggleFormUnit, ViewUnits, ViewForms],
                 &[Welcome],
             ],
         );
-        menu(ui, mc, &mut fired, "Project", &[&[Compile, Build]]);
+        menu(
+            ui,
+            mc,
+            &mut fired,
+            "Project",
+            &[
+                &[AddToProject, RemoveFromProject, RenameUnit],
+                &[Compile, Build],
+                &[ProjectOptions],
+            ],
+        );
         menu(ui, mc, &mut fired, "Run", &[&[Run, RunWithoutDebugging]]);
         menu(
             ui,
