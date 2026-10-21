@@ -6,12 +6,20 @@ description = "IDE Object Pascal (Delphi) em Rust: editor, visualizador de DFM e
 
 [dependencies]
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+encoding_rs = "0.8.42"
+rfd = "0.17.2"
+ropey = { version = "1.6.1", default-features = false, features = ["simd"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "1.1.8"
 
 [dev-dependencies]
+encoding_rs = "0.8.42"
 tempfile = "3.27.0"
+
+[profile.dev]
+# o editor roda em todo quadro; sem otimizacao nenhuma o debug fica lento em arquivos grandes
+opt-level = 1
 
 [profile.dev.package."*"]
 # dependencias (egui, winit...) otimizadas mesmo em debug: a UI fica fluida sem custo no tempo de compilacao do crate

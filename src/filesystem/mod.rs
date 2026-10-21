@@ -1,4 +1,6 @@
-//! Acesso a disco compartilhado pela IDE: pasta de configuracao e gravacao atomica.
+//! Acesso a disco compartilhado pela IDE: pasta de configuracao, gravacao atomica e codificacao.
+
+pub mod encoding;
 
 use std::fs::{self, File};
 use std::io::{self, Write};
