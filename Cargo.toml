@@ -1,0 +1,21 @@
+[package]
+name = "argila"
+version = "0.1.0"
+edition = "2024"
+description = "IDE Object Pascal (Delphi) em Rust: editor, visualizador de DFM e arquitetura para DCC32/DCC64"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "accesskit"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "1.1.8"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.dev.package."*"]
+# dependencias (egui, winit...) otimizadas mesmo em debug: a UI fica fluida sem custo no tempo de compilacao do crate
+opt-level = 2
+
+[profile.release]
+lto = "thin"
