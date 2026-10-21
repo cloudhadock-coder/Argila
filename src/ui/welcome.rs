@@ -61,9 +61,9 @@ pub fn show(
             section(ui, p, "Status");
             ui.label(
                 RichText::new(
-                    "Phase 2 (code editor): .pas/.dfm editing with encoding and line ending preservation, \
-                     syntax highlighting, undo/redo, find & replace. Commands that are not implemented yet \
-                     say so instead of pretending.",
+                    "Phase 3 (Delphi projects): open .dproj/.dpr/.dpk or a folder, Project Explorer, \
+                     Structure, F12 between unit and form, declaration/implementation navigation. \
+                     Commands that are not implemented yet say so instead of pretending.",
                 )
                 .color(p.text_weak),
             );

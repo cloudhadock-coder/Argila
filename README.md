@@ -30,14 +30,15 @@ Configurações: `%APPDATA%\Argila\settings.toml`. Atalhos personalizados: `%APP
 | `filesystem/` | pasta de configuração, gravação atômica e `encoding` (BOM, UTF-8, ANSI, CRLF/LF) | não |
 | `editor/` | `buffer` (rope + desfazer), `document` (abrir/salvar), `ops`, `search`; `view` é o widget | só `view` |
 | `syntax/` | lexers Pascal e DFM por linha, com estado entre linhas calculado sob demanda | não |
+| `projects/` | `dpr`, `dproj` (XML), `outline` (estrutura de units/DFM), `files` (alterações com backup) e o modelo `Project` | não |
 | `diagnostics/` | mensagens do painel Messages | não |
 | `themes/` | paleta terrosa, visuais do egui, Segoe UI/Consolas do Windows | sim |
 
-Módulos das próximas fases: `projects/`, `dfm/` (parser, designer, componentes),
+Módulos das próximas fases: `dfm/` (parser, designer, componentes),
 `compiler/` (`CompilerBackend`, `dcc32`, `dcc64`), `autocomplete/`, `navigation/`.
 
 **Bibliotecas:** `eframe`/`egui` 0.31 (GUI), `ropey` (buffer), `encoding_rs` (ANSI), `rfd` (diálogo
-nativo de abrir), `serde` + `toml` + `serde_json`. Dev: `tempfile`.
+nativo de abrir), `roxmltree` (leitura do `.dproj`), `serde` + `toml` + `serde_json`. Dev: `tempfile`.
 
 - **Por que egui e não Slint:** editor de código, designer de DFM e grades do Object Inspector são
   desenho customizado; no modo imediato do egui isso sai direto pelo `Painter`.
@@ -132,6 +133,84 @@ convertida para Windows-1252, numa máquina Windows 11:
 
 O primeiro quadro leva de 30 a 50 ms, por causa do carregamento das fontes do Windows.
 
+## Fase 3 (projetos Delphi), concluída
+
+- **Abrir projetos** por `.dproj`, `.dpr`, `.dpk` ou uma pasta: File ▸ Open Project (Ctrl+F11) ou Open
+  Folder. Também pela linha de comando, arrastando o arquivo para a janela ou pelos recentes da
+  Welcome. A leitura roda em segundo plano, e nada é executado: o MSBuild, os `<Import>` e os scripts
+  são ignorados, e só o XML é lido.
+- **`.dpr`/`.dpk`:**
+  - `program`/`library`/`package`, `uses`/`contains` com `in '...'` e `{Form: TipoDoForm}`, e
+    `requires`;
+  - `{$R}`/`{$I}`, sem confundir chaves de compilador como `{$R+}`;
+  - entradas dentro de `{$IFDEF}` são marcadas;
+  - caminhos relativos (inclusive `..\`), acentos, espaços e nomes longos.
+- **`.dproj`:**
+  - configurações (Build Configurations) e plataformas;
+  - PropertyGroups por escopo (`Base`, `Cfg_1`, `Cfg_1_Win32`...) e valores **efetivos** por
+    configuração e plataforma, com a herança do Delphi e `$(Var)` expandido;
+  - `DCCReference`, inclusive as que não estão no `uses`;
+  - elementos desconhecidos são preservados.
+- **Units:**
+  - associação `.pas` ↔ `.dfm`;
+  - units ausentes (caminho declarado inexistente) separadas das units de biblioteca (`Forms`,
+    `Vcl.Themes`...);
+  - divergências entre `uses` e `.dproj` vão para o painel Messages;
+  - resolução de units pela pasta do projeto e pelo `DCC_UnitSearchPath`.
+- **Project Explorer:**
+  - árvore do projeto (fonte, `.dproj`, configurações, plataformas, units com o `.dfm`, requires e
+    outros arquivos);
+  - filtro por nome e teclado (setas, Enter);
+  - duplo clique abre o arquivo; menu de contexto com Open, Rename, Remove from Project e Add
+    Existing Unit;
+  - desenhado com `show_rows`, só as linhas visíveis.
+- **Structure:**
+  - uses, classes, records e interfaces com campos, métodos e propriedades, mais a lista de
+    implementações; para `.dfm`, a árvore de objetos;
+  - calculado em uma thread, 0,4 s depois da última edição; o clique navega até a declaração.
+- **Object Inspector:** dados do item selecionado (status, arquivo, form, tipo, `.dfm`, presença no
+  `uses` e no `.dproj`) ou do projeto, com busca.
+- **Navegação:**
+  - F12 alterna `.pas` ↔ `.dfm`; o `.dfm` continua no editor de texto até a Fase 4;
+  - Shift+Ctrl+Up/Down vai da declaração à implementação e volta, inclusive com sobrecargas e
+    rotinas aninhadas;
+  - Alt+Up / Ctrl+clique (Find Declaration): uma unit do `uses` abre o arquivo; um tipo, método ou
+    rotina da unit leva à declaração;
+  - Ctrl+F12 (View Units) e Shift+F12 (View Forms) listam com filtro.
+- **Alterações no projeto**, só por ação explícita e sempre com um diálogo que lista cada mudança:
+  - New Unit (opcionalmente adicionada ao projeto), Add to Project (Shift+F11), Remove from Project
+    (o arquivo não é apagado) e Rename Unit (`.pas`, `.dfm`, cabeçalho `unit`, `uses` e
+    `DCCReference`);
+  - a edição é cirúrgica: só o trecho da entrada muda, e o resto do `.dpr`/`.dproj` (comentários,
+    `{$IFDEF}`, XML desconhecido, codificação, BOM, CRLF) fica idêntico byte a byte;
+  - antes de gravar, o Argila confere que o arquivo não mudou desde a leitura e faz um backup em
+    `%APPDATA%\Argila\backups`;
+  - a operação é recusada se o arquivo estiver aberto com alterações não salvas.
+- **Project Options** (Shift+Ctrl+F11), somente leitura: dados gerais, valores efetivos (caminhos de
+  busca, defines, saídas, namespaces) e os PropertyGroups como estão escritos.
+- **Sessão:** o último projeto, os arquivos abertos com a linha do cursor, a aba ativa, a seleção e os
+  nós expandidos do Project Explorer voltam na próxima inicialização. Close Project fecha o projeto e
+  as abas dele sem fechar o Argila.
+- 25 testes novos, num total de **76**:
+  - parsing de DPR, DPROJ (efetivos e escopos), DPK e pasta;
+  - associação PAS/DFM, resolução de units, referências ausentes e arquivos quebrados;
+  - outline e navegação declaração/implementação;
+  - adicionar, remover e renomear preservando bytes e codificação, e recusa quando o arquivo mudou;
+  - nova unit, sessão e um projeto com 600 units;
+  - `real_project_smoke`, que lê um projeto real quando `ARGILA_REAL_PROJECT` aponta para ele.
+
+### Desempenho observado (Fase 3, build release)
+
+Medido com o `SistemaFacta.dproj` real (321 units, 313 com form, o `.dproj` tem 2.252 linhas):
+
+| Operação | Tempo |
+|---|---|
+| Carregar o projeto (parse do `.dpr` e `.dproj` e verificação de 630 arquivos), em segundo plano | 21–48 ms |
+| Projeto sintético de 600 units (teste automatizado, debug) | < 1 s |
+| Abrir `Unit_Fl_Funcionario.pas` (10.425 linhas) / `.dfm` (19.389 linhas) | 5–22 ms / 9–14 ms |
+| Outline de todas as 317 units (106 mil símbolos; a maior tem 40.437 linhas) | 5,8 s no total, fora da thread da interface |
+| Tempo médio de quadro navegando no projeto e no Structure | 1–4 ms (pior quadro ≈ 27 ms) |
+
 ### Atalhos do perfil padrão
 
 Confirmados no docwiki da Embarcadero: **Replace = Ctrl+R / Ctrl+H** e **Open Project = Ctrl+F11**.
@@ -162,9 +241,20 @@ da especificação: no Delphi, Ctrl+O é prefixo de combinações (Ctrl+O+O etc.
   picos de dezenas de ms.
 - **Acessibilidade:** o conteúdo do editor não é exposto à acessibilidade (AccessKit); menus, botões
   e barra de status são.
+- **Projetos:**
+  - as condições MSBuild não são avaliadas em geral. Só o padrão que o Delphi grava
+    (`'$(Cfg_1)'!=''` etc.) é interpretado, e o restante aparece como escrito em Project Options;
+  - a busca de units fora do projeto usa só o `DCC_UnitSearchPath` da configuração padrão, e
+    variáveis como `$(BDS)` não são resolvidas, então units da RTL/VCL aparecem como "library unit";
+  - Find Declaration conhece só as units do projeto e os símbolos da unit ativa; a busca de símbolos
+    em todo o projeto fica para a Fase 5;
+  - Rename Unit não atualiza as outras units que usam o nome antigo (o diálogo avisa);
+  - Remove from Project recusa entradas vizinhas de `{$IFDEF}`, que devem ser editadas à mão;
+  - Project Options é somente leitura.
+- **Árvore:** o Project Explorer não tem arrastar e soltar entre pastas virtuais, e não há grupos de
+  projetos (`.groupproj`).
 
 ## Próximos passos
 
-1. **Fase 3:** leitura de `.dpr`/`.dproj` sem alterá-los, Project Explorer, relação `.pas` ↔ `.dfm`.
-2. **Fase 4:** parser de DFM (porte do `tools/dfmviewer/dfm2html.py` do sistemahorus, com herança visual),
+1. **Fase 4:** parser de DFM (porte do `tools/dfmviewer/dfm2html.py` do sistemahorus, com herança visual),
    designer somente leitura e Object Inspector sincronizado.
