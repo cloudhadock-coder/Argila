@@ -28,6 +28,7 @@ pub struct EditorTab {
     pub id: u64,
     pub doc: Document,
     pub view: EditorView,
+    pub dfm: crate::dfm::Preview,
     outline: Option<Arc<Outline>>,
     outline_version: Option<u64>,
     outline_busy: bool,
@@ -35,7 +36,7 @@ pub struct EditorTab {
     changed_at: f64,
 }
 
-/// Abas da area central. O designer de formularios entra na Fase 4.
+/// Abas da area central. Cada DFM compartilha o documento entre Text e Design.
 pub enum Tab {
     Welcome,
     Editor(Box<EditorTab>),
@@ -155,6 +156,7 @@ pub struct ArgilaApp {
     options: dialogs::OptionsState,
     show_options: bool,
     inspector_filter: String,
+    binary_dfm: Option<PathBuf>,
     flash: Option<Flash>,
     pending: Vec<Command>,
     prompt: Option<Prompt>,
@@ -255,6 +257,7 @@ impl ArgilaApp {
             options: dialogs::OptionsState::default(),
             show_options: false,
             inspector_filter: String::new(),
+            binary_dfm: None,
             flash: None,
             pending: Vec::new(),
             prompt: None,
@@ -517,6 +520,7 @@ impl ArgilaApp {
             | Command::SearchAgain
             | Command::ToggleComment => {
                 if let Some(ed) = self.active_editor() {
+                    ed.dfm.design = false;
                     let (doc, view) = (&mut ed.doc, &mut ed.view);
                     match cmd {
                         Command::Undo => view.undo(doc),
@@ -528,7 +532,12 @@ impl ArgilaApp {
                     }
                 }
             }
-            Command::GotoLine => self.prompt = Some(Prompt::GotoLine(String::new())),
+            Command::GotoLine => {
+                if let Some(ed) = self.active_editor() {
+                    ed.dfm.design = false;
+                }
+                self.prompt = Some(Prompt::GotoLine(String::new()));
+            }
             Command::ToggleFormUnit => self.toggle_form_unit(now),
             Command::DeclImplToggle => self.toggle_decl_impl(now),
             Command::FindDeclaration => self.find_declaration(now),
@@ -825,11 +834,28 @@ impl ArgilaApp {
     // ------------------------------------------------------------------ navegacao
 
     fn toggle_form_unit(&mut self, now: f64) {
+        if let Some(ed) = self.active_editor() {
+            if ed.doc.language == Language::Dfm && !ed.dfm.design {
+                ed.dfm.design = true;
+                return;
+            }
+            if ed.doc.language == Language::Dfm && related_file(&ed.doc.path).is_none() {
+                ed.dfm.design = false;
+                return;
+            }
+        }
         let Some(path) = self.active_path().map(Path::to_path_buf) else {
             return;
         };
         match related_file(&path) {
-            Some(other) => self.open_path(&other, now),
+            Some(other) => {
+                self.open_path(&other, now);
+                if let Some(ed) = self.active_editor() {
+                    if ed.doc.language == Language::Dfm {
+                        ed.dfm.design = true;
+                    }
+                }
+            }
             None => {
                 let what = if path
                     .extension()
@@ -980,6 +1006,47 @@ impl ArgilaApp {
     }
 
     fn inspector_item(&self) -> Option<InspectorItem> {
+        if let Some(Tab::Editor(ed)) = self.tabs.get(self.active) {
+            if ed.doc.language == Language::Dfm {
+                if ed.dfm.version != Some(ed.doc.buffer.version()) {
+                    return None;
+                }
+                if let Some(Ok(form)) = &ed.dfm.result {
+                    let c = form.root.find(&ed.dfm.selected).unwrap_or(&form.root);
+                    let mut rows = vec![
+                        ("Hierarchy".into(), ed.dfm.selected.clone()),
+                        ("Declaration".into(), format!("{:?}", c.kind)),
+                    ];
+                    if c.kind == crate::dfm::parser::ObjectKind::Inherited {
+                        rows.push((
+                            "Inheritance".into(),
+                            "Stored overrides only; base properties are not resolved.".into(),
+                        ));
+                    }
+                    rows.extend(c.properties.iter().map(|p| {
+                        let value = if matches!(p.value, crate::dfm::parser::Value::Binary) {
+                            format!(
+                                "Binary data ({} hex digits); inspect full value in Text.",
+                                p.raw.chars().filter(char::is_ascii_hexdigit).count()
+                            )
+                        } else {
+                            let mut s: String = p.raw.chars().take(1000).collect();
+                            if p.raw.chars().nth(1000).is_some() {
+                                s.push_str("… [full value in Text]");
+                            }
+                            s
+                        };
+                        (p.name.clone(), value)
+                    }));
+                    return Some(InspectorItem {
+                        title: c.name.clone(),
+                        class: c.class.clone(),
+                        rows,
+                    });
+                }
+                return None;
+            }
+        }
         let project = self.project.as_ref()?;
         let sel = self.explorer.selected.as_deref()?;
         let yes = |b: bool| if b { "Yes" } else { "No" }.to_owned();
@@ -1202,6 +1269,7 @@ impl ArgilaApp {
                     id: self.next_id,
                     doc,
                     view,
+                    dfm: crate::dfm::Preview::default(),
                     outline: None,
                     outline_version: None,
                     outline_busy: false,
@@ -1211,6 +1279,9 @@ impl ArgilaApp {
                 self.active = self.tabs.len() - 1;
                 self.settings.recent.push_file(&path.to_string_lossy());
                 self.mark_dirty(now);
+            }
+            Err(crate::editor::document::OpenError::Binary("binary DFM (TPF0)")) => {
+                self.binary_dfm = Some(path.clone());
             }
             Err(e) => self.notify(
                 Level::Error,
@@ -1495,12 +1566,74 @@ impl ArgilaApp {
                     Some(welcome::WelcomeAction::OpenRecent(path)) => {
                         self.open_any(Path::new(&path), now)
                     }
+                    Some(welcome::WelcomeAction::OpenForm) => {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .set_title("Open DFM in Design")
+                            .add_filter("Delphi form", &["dfm"])
+                            .pick_file()
+                        {
+                            self.open_path(&path, now);
+                            if let Some(ed) = self.active_editor() {
+                                if ed.doc.language == Language::Dfm {
+                                    ed.dfm.design = true;
+                                }
+                            }
+                        }
+                    }
+                    Some(welcome::WelcomeAction::DemoForm) => match crate::dfm::demo_copy() {
+                        Ok(path) => {
+                            self.open_path(&path, now);
+                            if let Some(ed) = self.active_editor() {
+                                ed.dfm.design = true;
+                            }
+                        }
+                        Err(error) => self.notify(
+                            Level::Error,
+                            format!("Could not open designer demo: {error}"),
+                            now,
+                        ),
+                    },
                     None => {}
                 }
             }
             Some(Tab::Editor(ed)) => {
+                if ed.doc.language == Language::Dfm {
+                    let version = ed.doc.buffer.version();
+                    ed.dfm.update(version, || ed.doc.buffer.text(), &self.ctx);
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut ed.dfm.design, false, "Text");
+                        ui.selectable_value(&mut ed.dfm.design, true, "Design");
+                    });
+                    if ed.dfm.design {
+                        match ed.dfm.result.clone() {
+                            Some(Ok(form)) => {
+                                if let Some(line) =
+                                    crate::dfm::designer::show(ui, &form, &mut ed.dfm)
+                                {
+                                    ed.dfm.design = false;
+                                    ed.view.goto(&mut ed.doc, line, 0);
+                                }
+                            }
+                            Some(Err(error)) => {
+                                ui.colored_label(p.error, error.to_string());
+                                if ui.button("Go to error in text").clicked() {
+                                    ed.dfm.design = false;
+                                    ed.view.goto(&mut ed.doc, error.line, error.column);
+                                }
+                            }
+                            None => {
+                                ui.spinner();
+                                ui.label("Parsing DFM…");
+                            }
+                        }
+                        return;
+                    }
+                }
                 let out = ed.view.show(ui, &mut ed.doc, &style, now, interactive);
                 self.cursor = Some((out.line, out.col));
+                if let Some(Ok(form)) = &ed.dfm.result {
+                    ed.dfm.selected = form.root.path_at_line(out.line.saturating_sub(1));
+                }
                 if std::mem::take(&mut ed.view.ctrl_clicked) {
                     self.pending.push(Command::FindDeclaration);
                 }
@@ -2035,6 +2168,9 @@ impl eframe::App for ArgilaApp {
                 }
                 ExplorerAction::Navigate(line, col) => {
                     if let Some(ed) = self.active_editor() {
+                        if let Some(Ok(form)) = &ed.dfm.result {
+                            ed.dfm.selected = form.root.path_at_line(line);
+                        }
                         ed.view.goto(&mut ed.doc, line, col);
                     }
                 }
@@ -2069,6 +2205,21 @@ impl eframe::App for ArgilaApp {
         }
 
         self.show_prompt(ctx, now);
+        if let Some(path) = self.binary_dfm.clone() {
+            let mut open = true;
+            egui::Window::new("Binary DFM — original preserved")
+                .open(&mut open).resizable(true).show(ctx, |ui| {
+                    ui.label(path.display().to_string());
+                    ui.label("This file has the TPF0 binary signature. Text editing and saving are disabled.");
+                    ui.label("Safe conversion: use Delphi System.Classes.ObjectBinaryToText with separate input/output streams, writing a NEW text .dfm copy. Do not use ReadComponent or instantiate the form. Open the converted copy here; keep the binary original unchanged.");
+                    ui.hyperlink_to("Official ObjectBinaryToText documentation", "https://docwiki.embarcadero.com/Libraries/Alexandria/en/System.Classes.ObjectBinaryToText");
+                    ui.label("Argila does not run external converters automatically.");
+                    if ui.button("Open converted text copy…").clicked() { self.pending.push(Command::OpenFile); }
+                });
+            if !open {
+                self.binary_dfm = None;
+            }
+        }
         for cmd in std::mem::take(&mut self.pending) {
             self.run(ctx, cmd);
         }

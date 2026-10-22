@@ -10,6 +10,8 @@ use crate::themes::Palette;
 pub enum WelcomeAction {
     Command(Command),
     OpenRecent(String),
+    OpenForm,
+    DemoForm,
 }
 
 pub fn show(
@@ -37,6 +39,14 @@ pub fn show(
             });
 
             ui.add_space(18.0);
+            section(ui, p, "Form Designer");
+            ui.label("Open a .dfm to see its form, component tree and properties. From a Pascal unit, press F12.");
+            ui.horizontal(|ui| {
+                if ui.button("Open DFM in Design…").clicked() { fired = Some(WelcomeAction::OpenForm); }
+                if ui.button("Try designer demo").clicked() { fired = Some(WelcomeAction::DemoForm); }
+            });
+
+            ui.add_space(18.0);
             section(ui, p, "Recent");
             let items: Vec<&String> = recent.projects.iter().chain(&recent.files).take(RecentSettings::MAX).collect();
             if items.is_empty() {
@@ -61,9 +71,8 @@ pub fn show(
             section(ui, p, "Status");
             ui.label(
                 RichText::new(
-                    "Phase 3 (Delphi projects): open .dproj/.dpr/.dpk or a folder, Project Explorer, \
-                     Structure, F12 between unit and form, declaration/implementation navigation. \
-                     Commands that are not implemented yet say so instead of pretending.",
+                    "Phase 4: DFM form preview, component selection, Properties / Events and Text / Design. \
+                     The designer is read-only; edit properties in Text. Delphi projects and PAS editing are available.",
                 )
                 .color(p.text_weak),
             );

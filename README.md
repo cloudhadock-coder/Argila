@@ -31,11 +31,12 @@ Configurações: `%APPDATA%\Argila\settings.toml`. Atalhos personalizados: `%APP
 | `editor/` | `buffer` (rope + desfazer), `document` (abrir/salvar), `ops`, `search`; `view` é o widget | só `view` |
 | `syntax/` | lexers Pascal e DFM por linha, com estado entre linhas calculado sob demanda | não |
 | `projects/` | `dpr`, `dproj` (XML), `outline` (estrutura de units/DFM), `files` (alterações com backup) e o modelo `Project` | não |
+| `dfm/` | `parser` (modelo e posições no texto), `components` (layout), `designer` (canvas), cache versionado em segundo plano | só `designer` e o agendamento da prévia |
 | `diagnostics/` | mensagens do painel Messages | não |
 | `themes/` | paleta terrosa, visuais do egui, Segoe UI/Consolas do Windows | sim |
 
-Módulos das próximas fases: `dfm/` (parser, designer, componentes),
-`compiler/` (`CompilerBackend`, `dcc32`, `dcc64`), `autocomplete/`, `navigation/`.
+Módulos das próximas fases: `compiler/` (`CompilerBackend`, `dcc32`, `dcc64`),
+`autocomplete/`, `navigation/`.
 
 **Bibliotecas:** `eframe`/`egui` 0.31 (GUI), `ropey` (buffer), `encoding_rs` (ANSI), `rfd` (diálogo
 nativo de abrir), `roxmltree` (leitura do `.dproj`), `serde` + `toml` + `serde_json`. Dev: `tempfile`.
@@ -171,7 +172,7 @@ O primeiro quadro leva de 30 a 50 ms, por causa do carregamento das fontes do Wi
 - **Object Inspector:** dados do item selecionado (status, arquivo, form, tipo, `.dfm`, presença no
   `uses` e no `.dproj`) ou do projeto, com busca.
 - **Navegação:**
-  - F12 alterna `.pas` ↔ `.dfm`; o `.dfm` continua no editor de texto até a Fase 4;
+  - F12 abre o `.dfm` relacionado em Design; a partir do designer volta à unit `.pas`;
   - Shift+Ctrl+Up/Down vai da declaração à implementação e volta, inclusive com sobrecargas e
     rotinas aninhadas;
   - Alt+Up / Ctrl+clique (Find Declaration): uma unit do `uses` abre o arquivo; um tipo, método ou
@@ -218,6 +219,48 @@ Os demais seguem o keymap Default do Delphi e ainda devem ser conferidos em
 *Tools ▸ Options ▸ Editor Options ▸ Key Mappings* de um Delphi 12. O **Ctrl+O** para abrir arquivo vem
 da especificação: no Delphi, Ctrl+O é prefixo de combinações (Ctrl+O+O etc.), que ainda não existem aqui.
 
+## Fase 4 — Visualização DFM
+
+- Parser textual sem dependências novas: `object`, `inherited`, `inline`, índices de filhos,
+  propriedades com nomes compostos, números decimais/hexadecimais, identificadores, conjuntos,
+  listas, coleções `item/end`, strings com aspas duplicadas, `#decimal`, `#$hex` e continuação `+`.
+- Texto original, posições e valores desconhecidos são preservados no modelo. O designer não
+  reserializa o DFM; salvar continua usando o buffer e a codificação original do editor.
+- Abas **Text / Design** para DFM, com análise em segundo plano e cache por versão do buffer.
+  Erros mostram linha/coluna e botão para navegar ao texto; uma edição invalida a prévia anterior.
+- Canvas somente leitura com zoom, rolagem, seleção e placeholders para classes desconhecidas.
+  Representações para TForm (inclusive classes próprias na raiz), TPanel, TButton, TEdit, TLabel,
+  TMemo, TComboBox, TCheckBox, TRadioButton, TListBox, TGroupBox, TPageControl, TTabSheet,
+  TDBGrid e TDBEdit. Dados de banco e eventos nunca são executados.
+- Layout aproximado respeitando Left/Top/Width/Height, ClientWidth/ClientHeight, Caption,
+  Align, Anchors, Visible e Enabled, incluindo containers e recorte de filhos.
+  **Inspect resizing / anchors** altera apenas o tamanho da prévia, sem modificar o arquivo.
+- Árvore de componentes no designer e seleção sincronizada com Object Inspector (F11):
+  Properties, eventos `On*`, busca, declaração herdada e propriedades desconhecidas.
+  Clique nas abas do PageControl ou selecione uma página na árvore para inspecioná-la.
+  Duplo clique no controle/árvore ou **Go to source** navega ao texto; o cursor textual também
+  seleciona o componente correspondente. O Structure existente seleciona pela linha do objeto.
+- F12: da unit abre o form em Design; de um DFM em Text abre Design; de Design volta à unit
+  relacionada ou, sem unit, ao texto do próprio DFM. Text / Design ficam sempre acessíveis.
+- DFM binário TPF0 é identificado e bloqueado para edição. Um diálogo explica a conversão
+  manual segura para **outra cópia**, com streams separados e
+  [ObjectBinaryToText](https://docwiki.embarcadero.com/Libraries/Alexandria/en/System.Classes.ObjectBinaryToText),
+  e permite abrir a cópia textual. Não há conversor binário embutido e o original não é alterado.
+- 12 testes novos (88 ao todo): parser, entradas inválidas/Unicode, coleções e dados desconhecidos,
+  limites de profundidade, layout/anchors, páginas, renderização egui sem janela, descarte de
+  análises desatualizadas, cliques/duplo clique e troca de páginas, proteção de binários e
+  abertura/edição/salvamento ANSI/CRLF byte a byte.
+
+Para experimentar com todos os controles suportados:
+
+```powershell
+cargo run --release -- tests/fixtures/preview.dfm
+```
+
+Selecione **Design**. Os valores do inspector são somente leitura; edite pelo modo Text.
+Na Welcome, **Open DFM in Design…** abre um formulário diretamente no designer.
+**Try designer demo** abre uma cópia temporária independente do exemplo incluído no executável.
+
 ## Limitações conhecidas
 
 - Os painéis podem ser escondidos e redimensionados, mas não reposicionados (docking entra depois).
@@ -234,6 +277,17 @@ da especificação: no Delphi, Ctrl+O é prefixo de combinações (Ctrl+O+O etc.
   - não há recuperação após queda (cópias automáticas de arquivos modificados);
   - a gravação atômica cria um arquivo novo, então atributos como somente leitura e ACLs
     personalizadas do original não são copiados.
+- **DFM:**
+  - a prévia é uma aproximação VCL; não executa controles nativos, eventos ou consultas;
+  - herança visual externa e frames não são expandidos: aparecem somente os dados declarados
+    no arquivo aberto, com indicação de `inherited`; classes de terceiros usam placeholders;
+  - fontes, cores, AutoSize, margens, constraints, ordem complexa de alinhamento e escalonamento
+    por DPI não reproduzem integralmente a VCL;
+  - imagens e blobs são preservados, mas não decodificados. O inspector abrevia valores longos;
+    o conteúdo integral fica no modo Text. A árvore de componentes ainda não é virtualizada;
+  - sem movimentação, redimensionamento persistido, edição no inspector ou conversão binária
+    automática. Zoom, seleção, página e tamanho da prévia não são persistidos na sessão;
+  - o parser limita profundidade a 128 e componentes a 100 mil, com erro explícito.
 - **Quebras e codificação:**
   - um arquivo com CRLF e LF misturados é salvo todo com a quebra predominante (com aviso);
   - "Reopen with" descarta o buffer, por isso só fica disponível sem alterações pendentes.
@@ -256,5 +310,7 @@ da especificação: no Delphi, Ctrl+O é prefixo de combinações (Ctrl+O+O etc.
 
 ## Próximos passos
 
-1. **Fase 4:** parser de DFM (porte do `tools/dfmviewer/dfm2html.py` do sistemahorus, com herança visual),
-   designer somente leitura e Object Inspector sincronizado.
+1. **Fase 5:** autocompletar por símbolos locais, navegação por símbolos, code folding,
+   busca global e divisão de editores.
+2. Evoluir a fidelidade DFM: resolução segura de herança/frames, imagens, fontes/DPI e
+   virtualização da árvore antes da futura edição bidirecional.

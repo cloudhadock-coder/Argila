@@ -1,0 +1,3 @@
+# Preserve vendor files byte for byte, including original CFG and license.
+bin/* binary
+*.rtf binary
