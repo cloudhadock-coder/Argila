@@ -25,21 +25,23 @@ Configurações: `%APPDATA%\Argila\settings.toml`. Atalhos personalizados: `%APP
 |---|---|---|
 | `app/` | estado da aplicação e execução de comandos (menu, barra, atalho e botão passam pelo mesmo caminho) | sim |
 | `ui/` | só desenha e devolve pedidos: `toolbar`, `explorer`, `inspector`, `console`, `statusbar`, `welcome`, `dialogs` | sim |
-| `shortcuts/` | `Command`, `KeyChord`, `Keymap` (perfil Delphi 12, JSON, conflitos) | só os tipos de tecla do egui |
+| `shortcuts/` | `Command`, `KeyChord` (inclusive sequências `Shift+Ctrl+K, T`), `Keymap` (perfil Delphi 12, JSON, conflitos) | só os tipos de tecla do egui |
 | `settings/` | configurações persistentes em TOML, com `.bak` se o arquivo estiver corrompido | não |
 | `filesystem/` | pasta de configuração, gravação atômica e `encoding` (BOM, UTF-8, ANSI, CRLF/LF) | não |
-| `editor/` | `buffer` (rope + desfazer), `document` (abrir/salvar), `ops`, `search`; `view` é o widget | só `view` |
-| `syntax/` | lexers Pascal e DFM por linha, com estado entre linhas calculado sob demanda | não |
+| `editor/` | `buffer` (rope + desfazer + registro de alterações), `document` (abrir/salvar), `ops`, `search`, `folding` (regiões recolhidas e mapa de linhas visíveis); `view` é o widget | só `view` |
+| `syntax/` | lexers Pascal e DFM por linha, com estado entre linhas calculado sob demanda; `folding` (regiões recolhíveis) | não |
 | `projects/` | `dpr`, `dproj` (XML), `outline` (estrutura de units/DFM), `files` (alterações com backup) e o modelo `Project` | não |
 | `dfm/` | `parser` (modelo e posições no texto), `components` (layout), `designer` (canvas), cache versionado em segundo plano | só `designer` e o agendamento da prévia |
+| `autocomplete/` | `context` (prefixo, expressão antes do ponto, escopo local), provedores (`CompletionProvider`), resolução de tipos e `class_completion` | não |
+| `navigation/` | `index` (símbolos do projeto, em paralelo e incremental), `history` (Alt+Left/Right), `find_in_files` | não |
 | `diagnostics/` | mensagens do painel Messages | não |
 | `themes/` | paleta terrosa, visuais do egui, Segoe UI/Consolas do Windows | sim |
 
-Módulos das próximas fases: `compiler/` (`CompilerBackend`, `dcc32`, `dcc64`),
-`autocomplete/`, `navigation/`.
+Módulo das próximas fases: `compiler/` (`CompilerBackend`, `dcc32`, `dcc64`).
 
 **Bibliotecas:** `eframe`/`egui` 0.31 (GUI), `ropey` (buffer), `encoding_rs` (ANSI), `rfd` (diálogo
-nativo de abrir), `roxmltree` (leitura do `.dproj`), `serde` + `toml` + `serde_json`. Dev: `tempfile`.
+nativo de abrir), `roxmltree` (leitura do `.dproj`), `regex` (Find in Files), `serde` + `toml` +
+`serde_json`. Dev: `tempfile`.
 
 - **Por que egui e não Slint:** editor de código, designer de DFM e grades do Object Inspector são
   desenho customizado; no modo imediato do egui isso sai direto pelo `Painter`.
@@ -217,7 +219,12 @@ Medido com o `SistemaFacta.dproj` real (321 units, 313 com form, o `.dproj` tem 
 Confirmados no docwiki da Embarcadero: **Replace = Ctrl+R / Ctrl+H** e **Open Project = Ctrl+F11**.
 Os demais seguem o keymap Default do Delphi e ainda devem ser conferidos em
 *Tools ▸ Options ▸ Editor Options ▸ Key Mappings* de um Delphi 12. O **Ctrl+O** para abrir arquivo vem
-da especificação: no Delphi, Ctrl+O é prefixo de combinações (Ctrl+O+O etc.), que ainda não existem aqui.
+da especificação: no Delphi, Ctrl+O é prefixo de combinações (Ctrl+O+O etc.). Atalhos em sequência
+existem desde a Fase 5 (os de code folding, Shift+Ctrl+K, …), mas os do Ctrl+O não estão no perfil.
+**Alt+Left/Alt+Right** (voltar/avançar depois de Find Declaration) constam do keymap padrão na
+documentação da Embarcadero; os acordes **Shift+Ctrl+K, …** de folding vêm de material da comunidade
+Delphi e podem ser trocados no `keymap.json`. **Go to Symbol (Shift+Alt+S)** é do Argila: o Delphi
+não tem um atalho padrão equivalente.
 
 ## Fase 4 — Visualização DFM
 
@@ -261,13 +268,93 @@ Selecione **Design**. Os valores do inspector são somente leitura; edite pelo m
 Na Welcome, **Open DFM in Design…** abre um formulário diretamente no designer.
 **Try designer demo** abre uma cópia temporária independente do exemplo incluído no executável.
 
+## Fase 5 — Recursos avançados, concluída
+
+- **Autocompletar** (Ctrl+Space, e sozinho depois de `.`; desligável em `editor.auto_completion`):
+  - locais da rotina: parâmetros, `var`/`const`, `Result`, `Self` e `var` inline do Delphi 10.3+
+    (tipo inferido de `TFoo.Create`);
+  - membros da classe do método, com herança entre units do projeto;
+  - depois do ponto, a expressão é resolvida pelo tipo: `Self.`, `Objeto.Campo.`, variáveis globais
+    de outras units (`DmFiltros.qry…`), `Unit.` (o que a interface exporta) e enumerações
+    (`TModo.`);
+  - dentro de `uses`, as units do projeto;
+  - palavras-chave, tipos e rotinas do System e palavras do próprio arquivo, por último;
+  - nada aparece dentro de comentário, string ou diretiva;
+  - o popup filtra enquanto se digita; Enter/Tab aceitam e Esc fecha;
+  - cada fonte de sugestões é um `CompletionProvider`: um compilador ou servidor de linguagem pode
+    entrar depois sem mudar o editor.
+- **Class Completion** (Shift+Ctrl+C), como no Delphi, numa única transação (um Ctrl+Z desfaz):
+  - métodos declarados sem implementação ganham corpo vazio depois do último método da classe;
+  - sobrecargas são casadas pelos parâmetros; `abstract`, `external` e métodos de interface ficam
+    de fora; os valores padrão não são repetidos na implementação;
+  - `property Nome: Tipo;` vira `read FNome write SetNome`, com o campo, o setter na seção private
+    (criada se não existir) e o corpo `FNome := Value;`;
+  - com o cursor num método implementado mas não declarado, a declaração entra na classe;
+  - o cursor vai para o primeiro corpo criado.
+- **Navegação por símbolos:**
+  - índice do projeto em segundo plano: todas as units, em paralelo; ao salvar, só o que mudou é
+    relido;
+  - **Go to Symbol** (Shift+Alt+S): tipos, métodos, propriedades, campos, rotinas, constantes,
+    variáveis e valores de enumeração do projeto, por nome, prefixo, iniciais (`bc` =
+    `BotaoClick`), trecho ou `Classe.Membro`;
+  - **Find Declaration** (Alt+Up / Ctrl+clique) agora atravessa units: locais, membros herdados,
+    `Objeto.Membro` pelo tipo do objeto e declarações globais;
+  - **Browse Back/Forward** (Alt+Left/Alt+Right) voltam e refazem os saltos de Find Declaration,
+    declaração/implementação, Go to Symbol, Go to Line, Structure e resultados de busca.
+- **Code folding:**
+  - recolhem rotinas (com seções locais), classes/records/interfaces, `begin`/`try`/`case`/
+    `repeat`, `uses`, seções interface/implementation, `{$REGION}` e comentários longos; no DFM,
+    objetos, itens de coleção e valores de várias linhas;
+  - caixa [-]/[+] na margem e "..." clicável depois da linha recolhida;
+  - setas e Page Up/Down pulam as regiões recolhidas; um salto para dentro de uma delas a abre;
+  - as regiões acompanham as edições até a próxima análise;
+  - comandos no menu Edit e acordes do Delphi: Shift+Ctrl+K, T (alternar), E (recolher), U
+    (expandir), A (expandir tudo), M (métodos), C (classes), R (regiões), P (rotinas aninhadas), G
+    (seções), O (liga/desliga). A barra de status avisa enquanto espera a segunda tecla.
+- **Find in Files** (Shift+Ctrl+F):
+  - escopo: arquivos do projeto (`.pas`, `.dfm`, `.dpr`/`.dpk`, `.inc`), arquivos abertos ou uma
+    pasta com máscaras e subpastas (pula `__history`, `.git`, `Win32`...);
+  - opções de maiúsculas, palavra inteira e expressão regular;
+  - roda em threads e pode ser cancelada; cada arquivo é lido na codificação detectada, e os
+    abertos usam o texto em memória (inclusive o não salvo);
+  - binários (DFM TPF0) são pulados; nada é alterado;
+  - resultados agrupados por arquivo no painel **Search Results**, com o trecho destacado; o clique
+    abre o arquivo com a ocorrência selecionada.
+- **Editor dividido** (View ▸ Split Editor Vertically/Horizontally, Switch Editor Pane, Close Split):
+  - dois painéis com o mesmo arquivo (cada um com seu cursor e rolagem) ou arquivos diferentes;
+  - o painel com foco recebe as abas e os comandos; um clique no outro painel passa o foco;
+  - a divisória é arrastável; orientação, proporção e o arquivo do segundo painel voltam na
+    próxima sessão.
+- Comandos do menu devolvem o teclado ao editor, como no Delphi.
+- 22 testes novos, num total de **110**:
+  - autocompletar com herança entre units, `uses`, enumeração, comentário/string e ranking;
+  - Class Completion: corpos, sobrecargas, `abstract`, propriedades, seção private nova e
+    declaração de método implementado;
+  - índice (busca, reaproveitamento, cancelamento), Find in Files (cp1252, BOM, binário, buffer
+    aberto, regex inválida, máscaras), folding (Pascal, DFM, mapa de linhas, deslocamento por
+    edição), registro de alterações do buffer, histórico e atalhos em sequência;
+  - `real_project_index_search_and_completion`, que roda num projeto real quando
+    `ARGILA_REAL_PROJECT` aponta para ele.
+
+### Desempenho observado (Fase 5, build release)
+
+Medido com o `SistemaFacta.dproj` real (317 units existentes):
+
+| Operação | Tempo |
+|---|---|
+| Indexar o projeto (83 mil símbolos), em segundo plano | 340–384 ms com o disco em cache; ~1,5–1,9 s na primeira leitura |
+| Reindexar sem alterações / depois de salvar uma unit | 2 ms / 3 ms |
+| Go to Symbol (300 resultados entre 83 mil símbolos) | 26 ms por tecla |
+| Autocompletar numa unit de 10.428 linhas / de 33.933 linhas | 33–35 ms / 31 ms |
+| Find in Files de `TDmFiltros` (630 arquivos) / de `Close` palavra inteira (11.317 ocorrências) | 226–280 ms / 206 ms |
+| Tempo médio de quadro no teste gráfico (857 quadros) | 2,0 ms (pior quadro ≈ 37 ms) |
+
 ## Limitações conhecidas
 
 - Os painéis podem ser escondidos e redimensionados, mas não reposicionados (docking entra depois).
 - Não há editor visual de atalhos; a personalização é feita pelo `keymap.json`.
 - **Editor:**
-  - sem seleção em coluna, múltiplos cursores, minimapa, code folding, destaque de `begin`/`end` e
-    autocompletar (Fase 5);
+  - sem seleção em coluna, múltiplos cursores, minimapa e destaque de `begin`/`end`;
   - sem suporte a IME (entrada de idiomas asiáticos);
   - sem quebra automática de linha;
   - caracteres largos (CJK) desalinham a grade monoespaçada.
@@ -300,17 +387,31 @@ Na Welcome, **Open DFM in Design…** abre um formulário diretamente no designe
     (`'$(Cfg_1)'!=''` etc.) é interpretado, e o restante aparece como escrito em Project Options;
   - a busca de units fora do projeto usa só o `DCC_UnitSearchPath` da configuração padrão, e
     variáveis como `$(BDS)` não são resolvidas, então units da RTL/VCL aparecem como "library unit";
-  - Find Declaration conhece só as units do projeto e os símbolos da unit ativa; a busca de símbolos
-    em todo o projeto fica para a Fase 5;
+  - Find Declaration e o autocompletar conhecem só os fontes do projeto: RTL/VCL e bibliotecas de
+    terceiros não são indexadas, então membros de `TForm`, `TADOQuery` etc. não aparecem;
   - Rename Unit não atualiza as outras units que usam o nome antigo (o diálogo avisa);
   - Remove from Project recusa entradas vizinhas de `{$IFDEF}`, que devem ser editadas à mão;
   - Project Options é somente leitura.
 - **Árvore:** o Project Explorer não tem arrastar e soltar entre pastas virtuais, e não há grupos de
   projetos (`.groupproj`).
+- **Autocompletar e Class Completion:**
+  - é um leitor tolerante, não um compilador: `with`, overloads de funções globais, genéricos
+    (`TList<T>.Items`), helpers e tipos de retorno encadeados por chamadas com parâmetros genéricos
+    não são resolvidos;
+  - a ordem dos itens é por relevância (locais, membros, unit, uses) e depois alfabética; não há
+    histórico de escolhas;
+  - o Class Completion acrescenta os corpos depois do último método da classe, na ordem de
+    declaração (o Delphi pode ordenar alfabeticamente), e não completa propriedades indexadas.
+- **Folding:** as regiões recolhidas não são guardadas na sessão; a marca da margem e o "..." só
+  respondem ao mouse e aos comandos.
+- **Find in Files:** não há substituir em arquivos; cada linha encontrada mostra até 400 caracteres
+  e a busca para em 50 mil ocorrências.
+- **Editor dividido:** são no máximo dois painéis, e o modo Text/Design de um DFM vale para os dois.
 
 ## Próximos passos
 
-1. **Fase 5:** autocompletar por símbolos locais, navegação por símbolos, code folding,
-   busca global e divisão de editores.
-2. Evoluir a fidelidade DFM: resolução segura de herança/frames, imagens, fontes/DPI e
+1. **Fase 6:** interface `CompilerBackend`, configuração de toolchains (caminho do DCC32/DCC64 de
+   uma instalação licenciada) e painel de mensagens/diagnósticos com navegação até o erro.
+2. Indexar opcionalmente as fontes da RTL/VCL de uma instalação licenciada para o autocompletar.
+3. Evoluir a fidelidade DFM: resolução segura de herança/frames, imagens, fontes/DPI e
    virtualização da árvore antes da futura edição bidirecional.
