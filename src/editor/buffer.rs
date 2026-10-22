@@ -3,6 +3,7 @@
 //! Posicoes sao indices de caractere. O texto usa so `\n` como quebra (a quebra original do
 //! arquivo fica no `TextFormat` do documento).
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use ropey::Rope;
@@ -52,6 +53,15 @@ pub enum EditKind {
     Other,
 }
 
+/// Uma alteracao aplicada ao texto: a linha onde comecou e quantas linhas ganhou (ou perdeu).
+/// Varias vistas do mesmo documento acompanham o texto por este registro.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LineChange {
+    pub version: u64,
+    pub line: usize,
+    pub delta: isize,
+}
+
 #[derive(Debug)]
 struct Transaction {
     edits: Vec<Edit>,
@@ -73,11 +83,14 @@ pub struct TextBuffer {
     can_extend: bool,
     version: u64,
     dirty_line: Option<usize>,
+    changes: VecDeque<LineChange>,
 }
 
 impl TextBuffer {
     /// Pausa maxima entre teclas para continuar o mesmo grupo de desfazer.
     pub const GROUP_SECONDS: f64 = 1.5;
+    /// Alteracoes guardadas para as vistas (um "substituir tudo" maior que isso recalcula tudo).
+    const CHANGE_LOG: usize = 4096;
 
     pub fn new(text: &str) -> Self {
         Self {
@@ -89,6 +102,7 @@ impl TextBuffer {
             can_extend: false,
             version: 0,
             dirty_line: None,
+            changes: VecDeque::new(),
         }
     }
 
@@ -180,6 +194,25 @@ impl TextBuffer {
         self.dirty_line.take()
     }
 
+    /// Alteracoes feitas depois de `version`, em ordem. None quando o registro ja nao cobre tudo
+    /// (quem pergunta deve recalcular do zero).
+    pub fn changes_since(&self, version: u64) -> Option<Vec<LineChange>> {
+        if version == self.version {
+            return Some(Vec::new());
+        }
+        let first = self.changes.front()?;
+        if first.version > version + 1 {
+            return None;
+        }
+        Some(
+            self.changes
+                .iter()
+                .filter(|c| c.version > version)
+                .copied()
+                .collect(),
+        )
+    }
+
     /// Troca `range` por `text` e poe o cursor no fim do que foi inserido.
     pub fn replace(&mut self, range: Range<usize>, text: &str, kind: EditKind, now: f64) {
         let after = Selection::caret(range.start + text.chars().count());
@@ -269,6 +302,15 @@ impl TextBuffer {
             self.rope.insert(edit.at, &edit.inserted);
         }
         self.version += 1;
+        let lines = |s: &str| s.bytes().filter(|&b| b == b'\n').count() as isize;
+        if self.changes.len() == Self::CHANGE_LOG {
+            self.changes.pop_front();
+        }
+        self.changes.push_back(LineChange {
+            version: self.version,
+            line,
+            delta: lines(&edit.inserted) - lines(&edit.removed),
+        });
     }
 
     pub fn undo(&mut self) -> bool {
@@ -387,6 +429,29 @@ mod tests {
         b.undo();
         assert_eq!(b.text(), "a a a");
         assert_eq!(b.take_dirty_line(), Some(0));
+    }
+
+    #[test]
+    fn change_log_reports_lines_and_deltas() {
+        let mut b = TextBuffer::new("a\nb\nc");
+        let v0 = b.version();
+        b.set_selection(Selection::caret(2));
+        b.insert("x\ny\n", EditKind::Other, 0.0);
+        let v1 = b.version();
+        b.replace(0..2, "", EditKind::Other, 1.0);
+        let all = b.changes_since(v0).unwrap();
+        assert_eq!(
+            all.iter().map(|c| (c.line, c.delta)).collect::<Vec<_>>(),
+            vec![(1, 2), (0, -1)]
+        );
+        assert_eq!(b.changes_since(v1).unwrap().len(), 1);
+        assert!(b.changes_since(b.version()).unwrap().is_empty());
+        b.undo();
+        assert_eq!(b.changes_since(v1 + 1).unwrap()[0].delta, 1);
+        for i in 0..5000 {
+            b.insert("z", EditKind::Other, 2.0 + i as f64);
+        }
+        assert!(b.changes_since(v0).is_none());
     }
 
     #[test]

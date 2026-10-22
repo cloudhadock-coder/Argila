@@ -5,6 +5,7 @@
 //! de 10 mil linhas nao reprocessa o arquivo todo.
 
 pub mod dfm;
+pub mod folding;
 pub mod pascal;
 
 use std::path::Path;

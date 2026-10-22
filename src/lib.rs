@@ -5,10 +5,12 @@
 //! entra em uma fase posterior.
 
 pub mod app;
+pub mod autocomplete;
 pub mod dfm;
 pub mod diagnostics;
 pub mod editor;
 pub mod filesystem;
+pub mod navigation;
 pub mod projects;
 pub mod settings;
 pub mod shortcuts;

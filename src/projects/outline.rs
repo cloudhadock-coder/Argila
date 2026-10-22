@@ -1,8 +1,9 @@
-//! Estrutura de uma unit (painel Structure e navegacao declaracao <-> implementacao).
+//! Estrutura de uma unit (painel Structure, navegacao, autocompletar e Class Completion).
 //!
 //! Usa o lexer da Fase 2, entao comentarios, strings e diretivas nunca confundem a analise.
 //! Nao e um compilador: e um leitor tolerante que pula o que nao entende.
 
+use crate::syntax::folding::{self, FoldRange};
 use crate::syntax::{Language, LexState, TokenKind, lex_line};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,9 +27,15 @@ pub struct Symbol {
     pub kind: SymbolKind,
     pub name: String,
     pub detail: String,
+    /// Tipo do campo/propriedade ou retorno da funcao (vazio quando nao se aplica).
+    pub ty: String,
+    /// Parametros como escritos, `(Sender: TObject)` (vazio sem parametros).
+    pub params: String,
     /// Linha e coluna (base 0) do nome.
     pub line: usize,
     pub col: usize,
+    /// Ultima linha da declaracao (o `end` de classes e o fim do corpo de rotinas).
+    pub end_line: usize,
     pub children: Vec<Symbol>,
 }
 
@@ -46,6 +53,15 @@ pub struct MethodDecl {
     pub key: String,
     pub line: usize,
     pub col: usize,
+    /// Classe com a grafia original e nome do metodo.
+    pub class_path: String,
+    pub name: String,
+    pub params: String,
+    pub ty: String,
+    /// Do `class`/`procedure` ate depois do `;` do cabecalho (sem as diretivas).
+    pub header: ((usize, usize), (usize, usize)),
+    /// Precisa de corpo na implementacao (nao e abstract/external nem de interface).
+    pub needs_body: bool,
 }
 
 /// Rotina com corpo na implementacao.
@@ -53,9 +69,71 @@ pub struct MethodDecl {
 pub struct Routine {
     pub key: Option<String>,
     pub name: String,
+    pub params: String,
+    pub ty: String,
     pub line: usize,
     pub col: usize,
     pub end_line: usize,
+    /// Do `class`/`procedure` ate depois do `;` do cabecalho.
+    pub header: ((usize, usize), (usize, usize)),
+}
+
+/// Declaracao no nivel da unit fora de classes: tipos, variaveis, constantes, valores de
+/// enumeracao e rotinas da interface. Alimenta o autocompletar e a busca de simbolos.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeclKind {
+    Type,
+    Variable,
+    Constant,
+    EnumValue,
+    Routine,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Declaration {
+    pub kind: DeclKind,
+    pub name: String,
+    pub ty: String,
+    pub params: String,
+    pub line: usize,
+    pub col: usize,
+    /// Declarada na secao interface (visivel para outras units).
+    pub interface: bool,
+}
+
+/// Secao de visibilidade dentro de uma classe (`private`, `strict private`, `public`...).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassSection {
+    pub visibility: String,
+    pub line: usize,
+}
+
+/// Onde fica cada parte de uma classe/record, para o Class Completion inserir codigo.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassInfo {
+    /// Caminho com a grafia original (`TExterna.TInterna`).
+    pub path: String,
+    pub kind: SymbolKind,
+    /// Linha do nome e linha/coluna do `end` que fecha a declaracao.
+    pub line: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub sections: Vec<ClassSection>,
+}
+
+/// `property` declarada numa classe (Class Completion completa `read`/`write`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyDecl {
+    pub class_path: String,
+    pub name: String,
+    pub ty: String,
+    pub indexed: bool,
+    pub has_read: bool,
+    pub has_write: bool,
+    pub line: usize,
+    pub col: usize,
+    /// Linha/coluna do `;` que fecha a declaracao.
+    pub semi: (usize, usize),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -64,56 +142,92 @@ pub struct Outline {
     pub used_units: Vec<UsedUnit>,
     pub decls: Vec<MethodDecl>,
     pub routines: Vec<Routine>,
+    pub declarations: Vec<Declaration>,
+    pub classes: Vec<ClassInfo>,
+    pub properties: Vec<PropertyDecl>,
+    /// Linha da palavra `implementation` e do que termina a secao (`initialization`,
+    /// `finalization` ou o `end.` final).
+    pub implementation_line: Option<usize>,
+    pub implementation_end: Option<usize>,
+    /// Regioes que o editor pode recolher.
+    pub folds: Vec<FoldRange>,
 }
 
+/// Token significativo (palavra, simbolo, numero ou string) com posicao.
 #[derive(Clone, Debug)]
-struct T {
-    low: String,
-    text: String,
-    line: usize,
-    col: usize,
-    kind: TokenKind,
+pub(crate) struct T {
+    pub low: String,
+    pub text: String,
+    pub line: usize,
+    pub col: usize,
+    pub kind: TokenKind,
 }
 
-fn tokens(text: &str) -> Vec<T> {
+pub(crate) fn tokens(text: &str) -> Vec<T> {
     let mut out = Vec::new();
     let mut state = LexState::Normal;
     let mut toks = Vec::new();
     for (line_no, line) in text.split('\n').enumerate() {
         let chars: Vec<char> = line.trim_end_matches('\r').chars().collect();
         state = lex_line(Language::Pascal, &chars, state, &mut toks);
-        for t in &toks {
-            if matches!(
-                t.kind,
-                TokenKind::Keyword | TokenKind::Identifier | TokenKind::Symbol
-            ) {
-                // simbolos sao de um caractere; o lexer junta vizinhos do mesmo tipo
-                if t.kind == TokenKind::Symbol {
-                    for (k, c) in chars[t.start..t.end].iter().enumerate() {
-                        if !c.is_whitespace() {
-                            out.push(T {
-                                low: c.to_string(),
-                                text: c.to_string(),
-                                line: line_no,
-                                col: t.start + k,
-                                kind: t.kind,
-                            });
-                        }
-                    }
-                } else {
-                    let text: String = chars[t.start..t.end].iter().collect();
-                    out.push(T {
-                        low: text.to_lowercase(),
-                        text,
-                        line: line_no,
-                        col: t.start,
-                        kind: t.kind,
-                    });
-                }
-            }
-        }
+        push_tokens(&chars, line_no, &toks, &mut out);
     }
     out
+}
+
+pub(crate) fn push_tokens(
+    chars: &[char],
+    line_no: usize,
+    toks: &[crate::syntax::Token],
+    out: &mut Vec<T>,
+) {
+    for t in toks {
+        match t.kind {
+            // simbolos sao de um caractere; o lexer junta vizinhos do mesmo tipo
+            TokenKind::Symbol => {
+                for (k, c) in chars[t.start..t.end].iter().enumerate() {
+                    if !c.is_whitespace() {
+                        out.push(T {
+                            low: c.to_string(),
+                            text: c.to_string(),
+                            line: line_no,
+                            col: t.start + k,
+                            kind: t.kind,
+                        });
+                    }
+                }
+            }
+            TokenKind::Keyword | TokenKind::Identifier | TokenKind::Number | TokenKind::String => {
+                let text: String = chars[t.start..t.end].iter().collect();
+                out.push(T {
+                    low: text.to_lowercase(),
+                    text,
+                    line: line_no,
+                    col: t.start,
+                    kind: t.kind,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Texto legivel de uma sequencia de tokens: `(const S: string; A, B: Integer = 0)`.
+pub(crate) fn join(toks: &[T]) -> String {
+    let mut s = String::new();
+    for (k, t) in toks.iter().enumerate() {
+        if k > 0 {
+            let p = &toks[k - 1];
+            let tight_before = matches!(t.low.as_str(), "," | ";" | ":" | ")" | "]" | "." | ">")
+                || (matches!(t.low.as_str(), "(" | "[" | "<") && p.kind != TokenKind::Symbol);
+            let tight_after = matches!(p.low.as_str(), "(" | "[" | "." | "<" | "@" | "^");
+            if !tight_before && !tight_after {
+                s.push(' ');
+            }
+        }
+        s.push_str(&t.text);
+    }
+    s
 }
 
 const ROUTINE: &[&str] = &[
@@ -173,6 +287,10 @@ impl Parser {
         self.t.get(i).map_or("", |t| t.low.as_str())
     }
 
+    fn pos(&self, i: usize) -> (usize, usize) {
+        self.t.get(i).map_or((0, 0), |t| (t.line, t.col))
+    }
+
     fn is_ident(&self, i: usize) -> bool {
         self.t.get(i).is_some_and(|t| {
             t.kind == TokenKind::Identifier
@@ -196,6 +314,64 @@ impl Parser {
             i += 2;
         }
         (name, i)
+    }
+
+    /// Em `(`: texto dos parametros, avancando para depois do `)` correspondente.
+    fn params(&mut self) -> String {
+        if self.low(self.i) != "(" {
+            return String::new();
+        }
+        let start = self.i;
+        let mut depth = 0i32;
+        while self.i < self.t.len() {
+            match self.low(self.i) {
+                "(" | "[" => depth += 1,
+                ")" | "]" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        self.i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            self.i += 1;
+        }
+        join(&self.t[start..self.i])
+    }
+
+    /// Texto de um tipo que comeca em `i` (sem avancar): ate `;`, `=` ou um especificador.
+    fn type_at(&self, i: usize) -> String {
+        let start = i;
+        let mut j = i;
+        let mut depth = 0i32;
+        while j < self.t.len() && j - start < 48 {
+            match self.low(j) {
+                "(" | "[" | "<" => depth += 1,
+                ")" | "]" | ">" => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                }
+                ";" | "=" if depth == 0 => break,
+                "read" | "write" | "default" | "stored" | "index" | "implements" | "nodefault"
+                | "absolute"
+                    if depth == 0 && j > start =>
+                {
+                    break;
+                }
+                "end" | "record" | "class" | "object" | "interface" | "packed" if depth == 0 => {
+                    if j == start {
+                        return self.t[j].text.clone();
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        join(&self.t[start..j])
     }
 
     /// O token abre um bloco terminado por `end`?
@@ -262,19 +438,37 @@ impl Parser {
         }
     }
 
-    fn skip_directives(&mut self) -> bool {
-        let mut forward = false;
+    /// Pula diretivas; devolve (forward ou external, abstract).
+    fn directives(&mut self) -> (bool, bool) {
+        let (mut forward, mut abstract_) = (false, false);
         while DIRECTIVES.contains(&self.low(self.i)) {
             forward |= matches!(self.low(self.i), "forward" | "external");
+            abstract_ |= self.low(self.i) == "abstract";
             self.skip_to_semicolon();
         }
-        forward
+        (forward, abstract_)
+    }
+
+    fn skip_directives(&mut self) -> bool {
+        self.directives().0
+    }
+
+    /// Fim (exclusivo) do cabecalho cujo `;` acabou de ser consumido.
+    fn header_end(&self, fallback: (usize, usize)) -> (usize, usize) {
+        let k = self.i.wrapping_sub(1);
+        if self.low(k) == ";" {
+            let (l, c) = self.pos(k);
+            (l, c + 1)
+        } else {
+            fallback
+        }
     }
 
     fn run(&mut self) {
         let mut impl_routines = Vec::new();
         while self.i < self.t.len() {
             let low = self.low(self.i).to_owned();
+            let line = self.pos(self.i).0;
             match low.as_str() {
                 "unit" | "program" | "library" | "package"
                     if self.out.symbols.is_empty() && self.is_ident(self.i + 1) =>
@@ -292,6 +486,15 @@ impl Parser {
                 }
                 "implementation" => {
                     self.interface = false;
+                    self.out.implementation_line.get_or_insert(line);
+                    self.i += 1;
+                }
+                "initialization" | "finalization" => {
+                    self.out.implementation_end.get_or_insert(line);
+                    self.i += 1;
+                }
+                "end" if self.low(self.i + 1) == "." => {
+                    self.out.implementation_end.get_or_insert(line);
                     self.i += 1;
                 }
                 "uses" | "contains" => {
@@ -300,7 +503,6 @@ impl Parser {
                     } else {
                         "Uses (implementation)"
                     };
-                    let line = self.t[self.i].line;
                     self.i += 1;
                     let mut group = sym(SymbolKind::Uses, label.to_owned(), "", line, 0);
                     while self.i < self.t.len() && self.low(self.i) != ";" {
@@ -330,6 +532,14 @@ impl Parser {
                     let types = self.type_section("");
                     self.out.symbols.extend(types);
                 }
+                "var" | "threadvar" => {
+                    self.i += 1;
+                    self.decl_section(DeclKind::Variable);
+                }
+                "const" | "resourcestring" => {
+                    self.i += 1;
+                    self.decl_section(DeclKind::Constant);
+                }
                 "class" if ROUTINE.contains(&self.low(self.i + 1)) => self.i += 1,
                 r if ROUTINE.contains(&r) => {
                     if let Some(s) = self.routine() {
@@ -349,6 +559,39 @@ impl Parser {
             );
             group.children = impl_routines;
             self.out.symbols.push(group);
+        }
+    }
+
+    /// `A, B: Tipo;` ou `C = valor;` de secoes var/const no nivel da unit.
+    fn decl_section(&mut self, kind: DeclKind) {
+        while self.is_ident(self.i) {
+            let mut names = Vec::new();
+            while self.is_ident(self.i) {
+                names.push(self.t[self.i].clone());
+                self.i += 1;
+                if self.low(self.i) == "," {
+                    self.i += 1;
+                } else {
+                    break;
+                }
+            }
+            let ty = match self.low(self.i) {
+                ":" => self.type_at(self.i + 1),
+                "=" => String::new(),
+                _ => return,
+            };
+            self.skip_to_semicolon();
+            for n in names {
+                self.out.declarations.push(Declaration {
+                    kind,
+                    name: n.text,
+                    ty: ty.clone(),
+                    params: String::new(),
+                    line: n.line,
+                    col: n.col,
+                    interface: self.interface,
+                });
+            }
         }
     }
 
@@ -379,6 +622,9 @@ impl Parser {
                 "record" => SymbolKind::Record,
                 "interface" | "dispinterface" => SymbolKind::Interface,
                 _ => {
+                    if prefix.is_empty() {
+                        self.simple_type(&name_tok, j);
+                    }
                     self.i = j;
                     self.skip_to_semicolon();
                     continue;
@@ -422,7 +668,20 @@ impl Parser {
             if self.low(k) == ";" {
                 self.i += 1; // TX = class(TY);
             } else {
-                self.members(&mut s, &path);
+                let sections = self.members(&mut s, &path, kind);
+                let end = self.i.wrapping_sub(1);
+                if self.low(end) == "end" {
+                    let (end_line, end_col) = self.pos(end);
+                    s.end_line = end_line;
+                    self.out.classes.push(ClassInfo {
+                        path,
+                        kind,
+                        line: name_tok.line,
+                        end_line,
+                        end_col,
+                        sections,
+                    });
+                }
                 if self.low(self.i) == ";" {
                     self.i += 1;
                 }
@@ -432,17 +691,59 @@ impl Parser {
         found
     }
 
-    fn members(&mut self, owner: &mut Symbol, path: &str) {
+    /// Tipo que nao e classe/record/interface: alias, enumeracao, conjunto, procedural...
+    fn simple_type(&mut self, name: &T, j: usize) {
+        let ty = self.type_at(j);
+        self.out.declarations.push(Declaration {
+            kind: DeclKind::Type,
+            name: name.text.clone(),
+            ty,
+            params: String::new(),
+            line: name.line,
+            col: name.col,
+            interface: self.interface,
+        });
+        if self.low(j) != "(" {
+            return;
+        }
+        let mut k = j + 1;
+        while k < self.t.len() && self.low(k) != ")" && self.low(k) != ";" {
+            if self.is_ident(k) && matches!(self.low(k + 1), "," | ")" | "=") {
+                let v = &self.t[k];
+                self.out.declarations.push(Declaration {
+                    kind: DeclKind::EnumValue,
+                    name: v.text.clone(),
+                    ty: name.text.clone(),
+                    params: String::new(),
+                    line: v.line,
+                    col: v.col,
+                    interface: self.interface,
+                });
+            }
+            k += 1;
+        }
+    }
+
+    fn members(&mut self, owner: &mut Symbol, path: &str, kind: SymbolKind) -> Vec<ClassSection> {
         let mut visibility = String::new();
+        let mut sections = Vec::new();
         while self.i < self.t.len() {
             let low = self.low(self.i).to_owned();
             match low.as_str() {
                 "end" => {
                     self.i += 1;
-                    return;
+                    return sections;
                 }
                 "private" | "protected" | "public" | "published" | "automated" => {
-                    visibility = low;
+                    visibility = if self.low(self.i.wrapping_sub(1)) == "strict" {
+                        format!("strict {low}")
+                    } else {
+                        low
+                    };
+                    sections.push(ClassSection {
+                        visibility: visibility.clone(),
+                        line: self.pos(self.i).0,
+                    });
                     self.i += 1;
                 }
                 "strict" | "class" | "var" | "const" | "threadvar" => self.i += 1,
@@ -458,6 +759,11 @@ impl Parser {
                     owner.children.extend(nested);
                 }
                 r if ROUTINE.contains(&r) => {
+                    let kw = if self.low(self.i.wrapping_sub(1)) == "class" {
+                        self.pos(self.i - 1)
+                    } else {
+                        self.pos(self.i)
+                    };
                     self.i += 1;
                     if !self.is_ident(self.i) {
                         continue;
@@ -465,20 +771,39 @@ impl Parser {
                     let t = self.t[self.i].clone();
                     let (name, next) = self.dotted(self.i);
                     self.i = next;
+                    let params = self.params();
+                    let ty = if self.low(self.i) == ":" {
+                        self.type_at(self.i + 1)
+                    } else {
+                        String::new()
+                    };
                     self.skip_to_semicolon();
-                    self.skip_directives();
+                    let header = (kw, self.header_end((t.line, t.col)));
+                    let (external, abstract_) = self.directives();
                     self.out.decls.push(MethodDecl {
                         key: format!("{path}.{name}").to_lowercase(),
                         line: t.line,
                         col: t.col,
+                        class_path: path.to_owned(),
+                        name: name.clone(),
+                        params: params.clone(),
+                        ty: ty.clone(),
+                        header,
+                        needs_body: kind != SymbolKind::Interface
+                            && !abstract_
+                            && !external
+                            && !name.contains('.'),
                     });
-                    owner.children.push(sym(
+                    let mut s = sym(
                         SymbolKind::Method,
                         name,
                         &format!("{low} {visibility}"),
                         t.line,
                         t.col,
-                    ));
+                    );
+                    s.params = params;
+                    s.ty = ty;
+                    owner.children.push(s);
                 }
                 "property" => {
                     self.i += 1;
@@ -487,29 +812,46 @@ impl Parser {
                     }
                     let t = self.t[self.i].clone();
                     let mut ty = String::new();
+                    let (mut has_read, mut has_write, mut indexed) = (false, false, false);
                     self.i += 1;
                     let mut depth = 0;
                     while self.i < self.t.len() {
                         match self.low(self.i) {
-                            "[" => depth += 1,
-                            "]" => depth -= 1,
-                            ":" if depth == 0 && ty.is_empty() => {
-                                if let Some(n) = self.t.get(self.i + 1) {
-                                    ty = n.text.clone();
-                                }
+                            "[" => {
+                                depth += 1;
+                                indexed |= ty.is_empty();
                             }
+                            "]" => depth -= 1,
+                            ":" if depth == 0 && ty.is_empty() => ty = self.type_at(self.i + 1),
+                            "read" if depth == 0 => has_read = true,
+                            "write" if depth == 0 => has_write = true,
                             ";" if depth == 0 => break,
+                            "end" => break,
                             _ => {}
                         }
                         self.i += 1;
                     }
-                    self.i += 1;
+                    let semi = self.pos(self.i);
+                    if self.low(self.i) == ";" {
+                        self.i += 1;
+                    }
                     if self.low(self.i) == "default" && self.low(self.i + 1) == ";" {
                         self.i += 2;
                     }
-                    owner
-                        .children
-                        .push(sym(SymbolKind::Property, t.text, &ty, t.line, t.col));
+                    self.out.properties.push(PropertyDecl {
+                        class_path: path.to_owned(),
+                        name: t.text.clone(),
+                        ty: ty.clone(),
+                        indexed,
+                        has_read,
+                        has_write,
+                        line: t.line,
+                        col: t.col,
+                        semi,
+                    });
+                    let mut s = sym(SymbolKind::Property, t.text, &ty, t.line, t.col);
+                    s.ty = ty;
+                    owner.children.push(s);
                 }
                 _ if self.is_ident(self.i) => {
                     let mut names = Vec::new();
@@ -525,26 +867,28 @@ impl Parser {
                     if self.low(self.i) != ":" {
                         continue;
                     }
-                    let ty = self
-                        .t
-                        .get(self.i + 1)
-                        .map(|t| t.text.clone())
-                        .unwrap_or_default();
+                    let ty = self.type_at(self.i + 1);
                     self.skip_to_semicolon();
                     for n in names {
-                        owner
-                            .children
-                            .push(sym(SymbolKind::Field, n.text, &ty, n.line, n.col));
+                        let mut s = sym(SymbolKind::Field, n.text, &ty, n.line, n.col);
+                        s.ty = ty.clone();
+                        owner.children.push(s);
                     }
                 }
                 _ => self.i += 1,
             }
         }
+        sections
     }
 
     /// Cabecalho de rotina fora de classe. Na implementacao tambem pula o corpo.
     fn routine(&mut self) -> Option<Symbol> {
         let kw = self.t[self.i].clone();
+        let kw_pos = if self.low(self.i.wrapping_sub(1)) == "class" {
+            self.pos(self.i - 1)
+        } else {
+            (kw.line, kw.col)
+        };
         self.i += 1;
         if !self.is_ident(self.i) {
             return None; // metodo anonimo
@@ -552,9 +896,30 @@ impl Parser {
         let name_tok = self.t[self.i].clone();
         let (name, next) = self.dotted(self.i);
         self.i = next;
+        let params = self.params();
+        let ty = if self.low(self.i) == ":" {
+            self.type_at(self.i + 1)
+        } else {
+            String::new()
+        };
         self.skip_to_semicolon();
+        let header = (kw_pos, self.header_end((name_tok.line, name_tok.col)));
         let forward = self.skip_directives();
-        if self.interface || forward {
+        if self.interface {
+            if !name.contains('.') {
+                self.out.declarations.push(Declaration {
+                    kind: DeclKind::Routine,
+                    name,
+                    ty,
+                    params,
+                    line: name_tok.line,
+                    col: name_tok.col,
+                    interface: true,
+                });
+            }
+            return None;
+        }
+        if forward {
             return None;
         }
         self.skip_body();
@@ -566,17 +931,24 @@ impl Parser {
         self.out.routines.push(Routine {
             key,
             name: name.clone(),
+            params: params.clone(),
+            ty: ty.clone(),
             line: name_tok.line,
             col: name_tok.col,
             end_line,
+            header,
         });
-        Some(sym(
+        let mut s = sym(
             SymbolKind::Routine,
             name,
             &kw.low,
             name_tok.line,
             name_tok.col,
-        ))
+        );
+        s.params = params;
+        s.ty = ty;
+        s.end_line = end_line;
+        Some(s)
     }
 
     /// Secoes locais, rotinas aninhadas e o bloco begin..end de uma rotina.
@@ -626,14 +998,24 @@ fn sym(kind: SymbolKind, name: String, detail: &str, line: usize, col: usize) ->
         kind,
         name,
         detail: detail.trim().to_owned(),
+        ty: String::new(),
+        params: String::new(),
         line,
         col,
+        end_line: line,
         children: Vec::new(),
     }
 }
 
-/// Outline de um fonte Pascal (.pas, .dpr, .dpk, .inc).
+/// Outline de um fonte Pascal (.pas, .dpr, .dpk, .inc), com as regioes de folding.
 pub fn pascal(text: &str) -> Outline {
+    let mut o = symbols_only(text);
+    o.folds = folding::pascal(text);
+    o
+}
+
+/// Outline sem as regioes de folding (indice do projeto, que nao precisa delas).
+pub fn symbols_only(text: &str) -> Outline {
     let mut p = Parser {
         t: tokens(text),
         i: 0,
@@ -674,7 +1056,8 @@ pub fn dfm(text: &str) -> Outline {
         } else if low == "item" {
             stack.push(None);
         } else if low == "end" || low == "end>" {
-            if let Some(Some(done)) = stack.pop() {
+            if let Some(Some(mut done)) = stack.pop() {
+                done.end_line = line_no;
                 match stack.iter_mut().rev().find_map(|s| s.as_mut()) {
                     Some(parent) => parent.children.push(done),
                     None => roots.push(done),
@@ -693,6 +1076,7 @@ pub fn dfm(text: &str) -> Outline {
     }
     Outline {
         symbols: roots,
+        folds: folding::dfm(text),
         ..Outline::default()
     }
 }
@@ -738,7 +1122,7 @@ impl Outline {
             .map(|u| u.name.as_str())
     }
 
-    /// Declaracao de tipo/metodo/rotina com este nome (sem diferenciar maiusculas).
+    /// Declaracao de tipo/metodo/rotina/constante com este nome (sem diferenciar maiusculas).
     pub fn find_symbol(&self, name: &str) -> Option<(usize, usize)> {
         fn walk(list: &[Symbol], name: &str) -> Option<(usize, usize)> {
             for s in list {
@@ -761,7 +1145,42 @@ impl Outline {
             }
             None
         }
-        walk(&self.symbols, name)
+        walk(&self.symbols, name).or_else(|| {
+            self.declarations
+                .iter()
+                .find(|d| d.name.eq_ignore_ascii_case(name))
+                .map(|d| (d.line, d.col))
+        })
+    }
+
+    /// Nome da unit (ou programa) declarado no cabecalho.
+    pub fn unit_name(&self) -> Option<&str> {
+        self.symbols
+            .first()
+            .filter(|s| s.kind == SymbolKind::Unit)
+            .map(|s| s.name.as_str())
+    }
+
+    /// Classe/record/interface declarada nesta unit (nome simples ou caminho `TA.TB`).
+    pub fn find_type(&self, name: &str) -> Option<&Symbol> {
+        fn walk<'a>(list: &'a [Symbol], name: &str) -> Option<&'a Symbol> {
+            for s in list {
+                if matches!(
+                    s.kind,
+                    SymbolKind::Class | SymbolKind::Record | SymbolKind::Interface
+                ) {
+                    if s.name.eq_ignore_ascii_case(name) {
+                        return Some(s);
+                    }
+                    if let Some(found) = walk(&s.children, name) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+        let last = name.rsplit('.').next().unwrap_or(name);
+        walk(&self.symbols, last)
     }
 }
 
