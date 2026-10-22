@@ -71,8 +71,10 @@ pub fn show(
             section(ui, p, "Status");
             ui.label(
                 RichText::new(
-                    "Phase 4: DFM form preview, component selection, Properties / Events and Text / Design. \
-                     The designer is read-only; edit properties in Text. Delphi projects and PAS editing are available.",
+                    "Phase 5: code completion (Ctrl+Space, after a dot), Class Completion (Shift+Ctrl+C), \
+                     Go to Symbol (Shift+Alt+S), project-wide Find Declaration with Alt+Left/Right history, \
+                     code folding (Shift+Ctrl+K, …), Find in Files (Shift+Ctrl+F) and split editors (View menu). \
+                     DFM preview, Delphi projects and PAS editing remain available.",
                 )
                 .color(p.text_weak),
             );
