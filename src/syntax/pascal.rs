@@ -5,7 +5,7 @@ use super::{Emitter, LexState, Token, TokenKind, find_seq, is_ident_char, is_ide
 
 /// Palavras reservadas e as diretivas que o Delphi realca fora de contexto. Diretivas que
 /// tambem sao nomes comuns (Name, Index, Read, Write, Default, Message...) ficam de fora.
-const KEYWORDS: &[&str] = &[
+pub(crate) const KEYWORDS: &[&str] = &[
     "and",
     "array",
     "as",

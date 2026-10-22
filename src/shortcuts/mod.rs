@@ -46,16 +46,34 @@ commands! {
     CodeCompletion => "edit.code_completion", "Code Completion";
     ClassCompletion => "edit.class_completion", "Complete Class at Cursor";
     DeclImplToggle => "edit.decl_impl", "Toggle Declaration/Implementation";
+    FoldToggle => "edit.fold_toggle", "Toggle Fold at Cursor";
+    FoldCollapse => "edit.fold_collapse", "Collapse Block";
+    FoldExpand => "edit.fold_expand", "Expand Block";
+    FoldExpandAll => "edit.fold_expand_all", "Expand All";
+    FoldMethods => "edit.fold_methods", "Collapse All Methods";
+    FoldClasses => "edit.fold_classes", "Collapse All Classes";
+    FoldRegions => "edit.fold_regions", "Collapse All Regions";
+    FoldNested => "edit.fold_nested", "Collapse Nested Procedures";
+    FoldSections => "edit.fold_sections", "Collapse Unit Sections";
+    CodeFolding => "edit.code_folding", "Code Folding";
     Find => "search.find", "Find...";
     Replace => "search.replace", "Replace...";
     FindInFiles => "search.find_in_files", "Find in Files...";
     SearchAgain => "search.again", "Search Again";
     GotoLine => "search.goto_line", "Go to Line Number...";
     FindDeclaration => "search.find_declaration", "Find Declaration";
+    GoToSymbol => "search.symbol", "Go to Symbol...";
+    NavigateBack => "search.back", "Browse Back";
+    NavigateForward => "search.forward", "Browse Forward";
     ProjectManager => "view.project_manager", "Project Manager";
     Structure => "view.structure", "Structure";
     ObjectInspector => "view.object_inspector", "Object Inspector";
     Messages => "view.messages", "Messages";
+    SearchResults => "view.search_results", "Search Results";
+    SplitVertical => "view.split_vertical", "Split Editor Vertically";
+    SplitHorizontal => "view.split_horizontal", "Split Editor Horizontally";
+    Unsplit => "view.unsplit", "Close Split";
+    SwitchPane => "view.switch_pane", "Switch Editor Pane";
     ToggleFormUnit => "view.toggle_form_unit", "Toggle Form/Unit";
     ViewUnits => "view.units", "Units...";
     ViewForms => "view.forms", "Forms...";
@@ -94,12 +112,15 @@ pub enum Availability {
     Unavailable(String),
 }
 
+/// Atalho: uma combinacao de teclas, opcionalmente seguida de uma segunda tecla, como os
+/// acordes do Delphi (`Shift+Ctrl+K, T`: segure Shift+Ctrl, aperte K e depois T).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct KeyChord {
     pub ctrl: bool,
     pub shift: bool,
     pub alt: bool,
     pub key: Key,
+    pub then: Option<Key>,
 }
 
 impl KeyChord {
@@ -109,7 +130,20 @@ impl KeyChord {
             shift: false,
             alt: false,
             key,
+            then: None,
         }
+    }
+
+    /// Segunda tecla de uma sequencia.
+    pub const fn then(mut self, key: Key) -> Self {
+        self.then = Some(key);
+        self
+    }
+
+    /// A primeira parte (sem a segunda tecla).
+    pub const fn first(mut self) -> Self {
+        self.then = None;
+        self
     }
 
     pub const fn ctrl(mut self) -> Self {
@@ -134,12 +168,20 @@ impl KeyChord {
             shift: modifiers.shift,
             alt: modifiers.alt,
             key,
+            then: None,
         }
     }
 
-    /// Aceita "Shift+Ctrl+S", "ctrl+shift+s", "Ctrl+Alt+F11", "Ctrl+/", "Ctrl++" etc.
+    /// Aceita "Shift+Ctrl+S", "ctrl+shift+s", "Ctrl+Alt+F11", "Ctrl+/", "Ctrl++" etc., e
+    /// sequencias "Shift+Ctrl+K, T".
     pub fn parse(text: &str) -> Result<Self, String> {
         let text = text.trim();
+        if let Some((first, second)) = text.split_once(", ") {
+            let second = second.trim();
+            let key =
+                parse_key(second).ok_or_else(|| format!("unknown key '{second}' in '{text}'"))?;
+            return Ok(Self::parse(first)?.then(key));
+        }
         let (mods, key_name) = match text.strip_suffix("++") {
             Some(rest) => (rest, "+"),
             None => text.rsplit_once('+').unwrap_or(("", text)),
@@ -217,7 +259,11 @@ impl fmt::Display for KeyChord {
         if self.alt {
             f.write_str("Alt+")?;
         }
-        f.write_str(key_label(self.key))
+        f.write_str(key_label(self.key))?;
+        if let Some(then) = self.then {
+            write!(f, ", {}", key_label(then))?;
+        }
+        Ok(())
     }
 }
 
@@ -266,6 +312,16 @@ impl Keymap {
             (ClassCompletion, k(Key::C).ctrl().shift()),
             (DeclImplToggle, k(Key::ArrowUp).ctrl().shift()),
             (DeclImplToggle, k(Key::ArrowDown).ctrl().shift()),
+            (FoldToggle, k(Key::K).ctrl().shift().then(Key::T)),
+            (FoldCollapse, k(Key::K).ctrl().shift().then(Key::E)),
+            (FoldExpand, k(Key::K).ctrl().shift().then(Key::U)),
+            (FoldExpandAll, k(Key::K).ctrl().shift().then(Key::A)),
+            (FoldMethods, k(Key::K).ctrl().shift().then(Key::M)),
+            (FoldClasses, k(Key::K).ctrl().shift().then(Key::C)),
+            (FoldRegions, k(Key::K).ctrl().shift().then(Key::R)),
+            (FoldNested, k(Key::K).ctrl().shift().then(Key::P)),
+            (FoldSections, k(Key::K).ctrl().shift().then(Key::G)),
+            (CodeFolding, k(Key::K).ctrl().shift().then(Key::O)),
             (Find, k(Key::F).ctrl()),
             (Replace, k(Key::R).ctrl()),
             (Replace, k(Key::H).ctrl()),
@@ -273,6 +329,9 @@ impl Keymap {
             (SearchAgain, k(Key::F3)),
             (GotoLine, k(Key::G).alt()),
             (FindDeclaration, k(Key::ArrowUp).alt()),
+            (NavigateBack, k(Key::ArrowLeft).alt()),
+            (NavigateForward, k(Key::ArrowRight).alt()),
+            (GoToSymbol, k(Key::S).shift().alt()),
             (ProjectManager, k(Key::F11).ctrl().alt()),
             (Structure, k(Key::F11).shift().alt()),
             (ObjectInspector, k(Key::F11)),
@@ -318,6 +377,18 @@ impl Keymap {
             .map(|(c, _)| *c)
     }
 
+    /// A combinacao inicia alguma sequencia (`Shift+Ctrl+K` de `Shift+Ctrl+K, T`)?
+    pub fn is_prefix(&self, chord: KeyChord) -> bool {
+        self.bindings
+            .iter()
+            .any(|(_, k)| k.then.is_some() && k.first() == chord.first())
+    }
+
+    /// Comando da sequencia `prefix` + `key` (a segunda tecla vale com ou sem modificadores).
+    pub fn lookup_sequence(&self, prefix: KeyChord, key: Key) -> Option<Command> {
+        self.lookup(prefix.first().then(key))
+    }
+
     /// Substitui todos os atalhos de um comando (lista vazia = sem atalho).
     pub fn set(&mut self, cmd: Command, chords: impl IntoIterator<Item = KeyChord>) {
         self.bindings.retain(|(c, _)| *c != cmd);
@@ -336,6 +407,21 @@ impl Keymap {
                 });
             if !entry.commands.contains(cmd) {
                 entry.commands.push(*cmd);
+            }
+        }
+        // uma combinacao simples que tambem inicia uma sequencia esconde a sequencia
+        for (_, chord) in &self.bindings {
+            if chord.then.is_none() && self.is_prefix(*chord) {
+                if let Some(entry) = by_chord.get_mut(&chord.to_string()) {
+                    for (other, k) in &self.bindings {
+                        if k.then.is_some()
+                            && k.first() == *chord
+                            && !entry.commands.contains(other)
+                        {
+                            entry.commands.push(*other);
+                        }
+                    }
+                }
             }
         }
         by_chord
@@ -450,6 +536,10 @@ mod tests {
             KeyChord::parse("Ctrl+ArrowDown").unwrap(),
             KeyChord::new(Key::ArrowDown).ctrl()
         );
+        let seq = KeyChord::parse("shift+ctrl+k, t").unwrap();
+        assert_eq!(seq.to_string(), "Shift+Ctrl+K, T");
+        assert_eq!(seq, KeyChord::new(Key::K).ctrl().shift().then(Key::T));
+        assert!(KeyChord::parse("Shift+Ctrl+K, Banana").is_err());
         assert!(KeyChord::parse("Hyper+S").is_err());
         assert!(KeyChord::parse("Ctrl+Banana").is_err());
     }

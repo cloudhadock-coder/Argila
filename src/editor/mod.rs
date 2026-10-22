@@ -3,6 +3,7 @@
 
 pub mod buffer;
 pub mod document;
+pub mod folding;
 pub mod ops;
 pub mod search;
 pub mod view;

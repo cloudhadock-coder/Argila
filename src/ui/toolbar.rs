@@ -40,6 +40,14 @@ pub fn menu_bar(ui: &mut Ui, mc: &MenuContext) -> Option<Command> {
                     ClassCompletion,
                     DeclImplToggle,
                 ],
+                &[
+                    FoldToggle,
+                    FoldExpandAll,
+                    FoldMethods,
+                    FoldClasses,
+                    FoldRegions,
+                    CodeFolding,
+                ],
             ],
         );
         menu(
@@ -49,7 +57,8 @@ pub fn menu_bar(ui: &mut Ui, mc: &MenuContext) -> Option<Command> {
             "Search",
             &[
                 &[Find, Replace, FindInFiles, SearchAgain],
-                &[GotoLine, FindDeclaration],
+                &[GotoLine, FindDeclaration, GoToSymbol],
+                &[NavigateBack, NavigateForward],
             ],
         );
         menu(
@@ -58,8 +67,15 @@ pub fn menu_bar(ui: &mut Ui, mc: &MenuContext) -> Option<Command> {
             &mut fired,
             "View",
             &[
-                &[ProjectManager, Structure, ObjectInspector, Messages],
+                &[
+                    ProjectManager,
+                    Structure,
+                    ObjectInspector,
+                    Messages,
+                    SearchResults,
+                ],
                 &[ToggleFormUnit, ViewUnits, ViewForms],
+                &[SplitVertical, SplitHorizontal, SwitchPane, Unsplit],
                 &[Welcome],
             ],
         );

@@ -1,0 +1,83 @@
+{
+  "source": "C:\\Program Files (x86)\\Embarcadero\\Studio\\37.0",
+  "copied_on": "2026-10-21",
+  "host": "Windows x86",
+  "targets": [
+    "Win32",
+    "Win64"
+  ],
+  "external_imports": [
+    "ADVAPI32.DLL",
+    "ADVAPI32.dll",
+    "KERNEL32.DLL",
+    "KERNEL32.dll",
+    "OLE32.DLL",
+    "OLEAUT32.DLL",
+    "PSAPI.DLL",
+    "USER32.DLL",
+    "USER32.dll",
+    "advapi32.dll",
+    "kernel32.dll",
+    "msvcrt.dll",
+    "ole32.dll",
+    "oleaut32.dll",
+    "user32.dll"
+  ],
+  "files": [
+    {
+      "path": "bin/borlndmm.dll",
+      "size": 79432,
+      "sha256": "0aa8a7668fd71356f7439fc414ebf654259dfe6e27e94b75efeb454c10d68b44"
+    },
+    {
+      "path": "bin/dcc32.cfg",
+      "size": 147,
+      "sha256": "f6f07e672728ca19681591bacbac023310daf91f1b66810c78452ba53c69cdcd"
+    },
+    {
+      "path": "bin/dcc32.exe",
+      "size": 23040,
+      "sha256": "0ab0624767648e7d98f553657bf73044b956493362073331506ef5b2aa135ef1"
+    },
+    {
+      "path": "bin/dcc32370.dll",
+      "size": 3454536,
+      "sha256": "e18539faf13f3533837a74717bae371a18f94a92c3c6ab03e9171270c146b869"
+    },
+    {
+      "path": "bin/dcc64.cfg",
+      "size": 147,
+      "sha256": "5bf969eac3b1dd9eac4ccb4d8a1716c5f42a83b48a0146fca2b6be18f508f12a"
+    },
+    {
+      "path": "bin/dcc64.exe",
+      "size": 23040,
+      "sha256": "0ab0624767648e7d98f553657bf73044b956493362073331506ef5b2aa135ef1"
+    },
+    {
+      "path": "bin/dcc64370.dll",
+      "size": 4382280,
+      "sha256": "5bd90f314b78763bc478d86893e2790ed312d178a529baba9dc9161e146161fc"
+    },
+    {
+      "path": "bin/dcc64370N.dll",
+      "size": 4473400,
+      "sha256": "9b1d88fa929dae62868f0bbb0860b814dddcd05921f893e6e6cf5c08a9dce4aa"
+    },
+    {
+      "path": "bin/lnkdfm370.dll",
+      "size": 1023048,
+      "sha256": "e0f1db82527703a3c19d74900b6a00398f40fcbecba3402b016e73b1b3503864"
+    },
+    {
+      "path": "bin/rlink32.dll",
+      "size": 86088,
+      "sha256": "cd3a4c084b3fabdc56e9edf6bc6301a46ad94ddb9ea4831dd99f3150091cfac0"
+    },
+    {
+      "path": "radstudio_license_en.rtf",
+      "size": 146697,
+      "sha256": "0d5e7f01f3e802dbcf395619047b787109bddb47d04456b4548592a34d5bbe44"
+    }
+  ]
+}

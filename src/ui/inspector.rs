@@ -1,7 +1,6 @@
 //! Painel direito: Object Inspector (abas Properties / Events e busca).
 //!
-//! Na Fase 3 mostra as informacoes do item selecionado no Project Explorer; componentes de
-//! formulario chegam com o designer na Fase 4.
+//! Mostra propriedades do projeto ou do componente DFM selecionado, sempre somente leitura.
 
 use eframe::egui::{self, Margin, RichText, Ui};
 
@@ -37,6 +36,7 @@ pub fn show(
                     .show_ui(ui, |_| {});
             });
             ui.add_space(6.0);
+            ui.small("Read-only");
             ui.horizontal(|ui| {
                 for (value, label) in [
                     (InspectorTab::Properties, "Properties"),
@@ -64,13 +64,7 @@ pub fn show(
                     "Nothing selected",
                     "Select a unit, form or the project in the Project Explorer.",
                 ),
-                (Some(_), InspectorTab::Events) => empty_state(
-                    ui,
-                    p,
-                    "No events",
-                    "Form component events arrive with the designer (phase 4).",
-                ),
-                (Some(item), InspectorTab::Properties) => {
+                (Some(item), selected_tab) => {
                     let needle = filter.trim().to_lowercase();
                     egui::ScrollArea::vertical()
                         .auto_shrink([false; 2])
@@ -81,6 +75,17 @@ pub fn show(
                                 .spacing([10.0, 4.0])
                                 .show(ui, |ui| {
                                     for (name, value) in &item.rows {
+                                        let event = name
+                                            .rsplit('.')
+                                            .next()
+                                            .unwrap_or(name)
+                                            .get(..2)
+                                            .is_some_and(|prefix| {
+                                                prefix.eq_ignore_ascii_case("On")
+                                            });
+                                        if event != (selected_tab == InspectorTab::Events) {
+                                            continue;
+                                        }
                                         if !needle.is_empty()
                                             && !name.to_lowercase().contains(&needle)
                                             && !value.to_lowercase().contains(&needle)

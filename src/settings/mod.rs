@@ -101,6 +101,10 @@ pub struct EditorSettings {
     /// Codificacao de arquivos sem BOM que nao sao UTF-8: "system" (ANSI do Windows, como o
     /// Delphi) ou um rotulo como "windows-1250" / "utf-8".
     pub default_encoding: String,
+    /// Regioes recolhiveis na margem (Shift+Ctrl+K, O liga/desliga).
+    pub code_folding: bool,
+    /// Abrir o autocompletar sozinho depois de `.`.
+    pub auto_completion: bool,
 }
 
 impl Default for EditorSettings {
@@ -109,6 +113,8 @@ impl Default for EditorSettings {
             font_size: 14.0,
             tab_size: 2,
             default_encoding: "system".to_owned(),
+            code_folding: true,
+            auto_completion: true,
         }
     }
 }
@@ -131,6 +137,28 @@ pub struct SessionSettings {
     pub selected: Option<String>,
     /// Ids dos nos expandidos no Project Explorer.
     pub expanded: Vec<String>,
+    /// Editor dividido: o arquivo do outro painel.
+    pub split: Option<SplitSession>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SplitSession {
+    /// Lado a lado (true) ou um sobre o outro.
+    pub vertical: bool,
+    pub file: String,
+    /// Fracao ocupada pelo primeiro painel.
+    pub ratio: f32,
+}
+
+impl Default for SplitSession {
+    fn default() -> Self {
+        Self {
+            vertical: true,
+            file: String::new(),
+            ratio: 0.5,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
